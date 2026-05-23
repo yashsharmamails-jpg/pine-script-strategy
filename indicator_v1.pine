@@ -1,0 +1,1491 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// © Institutional Crypto Futures Signal Engine v1.0
+
+//@version=5
+indicator("⚡ ICT Signal Engine", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000)
+
+// ══════════════════════════════════════════════════════════════
+// SECTION A — INPUTS
+// ══════════════════════════════════════════════════════════════
+
+// ─── Risk Management ───
+grpRisk = "Risk Management"
+i_accountSize   = input.float(1000.0, "Account Size (USD)", minval=100, maxval=1000000, group=grpRisk)
+i_riskPercent   = input.float(1.0, "Risk Per Trade (%)", minval=0.5, maxval=3.0, step=0.1, group=grpRisk)
+i_maxLeverage   = input.int(10, "Max Leverage", minval=1, maxval=20, group=grpRisk)
+i_atrMult       = input.float(1.0, "ATR Multiplier (Stop)", minval=0.5, maxval=3.0, step=0.1, group=grpRisk)
+i_dailyLimit    = input.int(2, "Daily Signal Limit", minval=1, maxval=5, group=grpRisk)
+
+// ─── Filters ───
+grpFilter = "Filters"
+i_htfFilter     = input.bool(true, "Enable HTF Trend Filter", group=grpFilter)
+i_sessionFilter = input.bool(true, "Enable Session Filter", group=grpFilter)
+i_newsFilter    = input.bool(false, "Block Signals Before News?", group=grpFilter)
+
+// ─── Visuals ───
+grpVis = "Visuals"
+i_showOB        = input.bool(true, "Show Order Blocks", group=grpVis)
+i_showFVG       = input.bool(true, "Show FVGs", group=grpVis)
+i_showLiq       = input.bool(true, "Show Liquidity Levels", group=grpVis)
+i_showStructure = input.bool(true, "Show Structure", group=grpVis)
+i_showAsian     = input.bool(true, "Show Asian Session", group=grpVis)
+i_showDash      = input.bool(true, "Show Dashboard", group=grpVis)
+i_showTPSL      = input.bool(true, "Show TP/SL Lines", group=grpVis)
+
+// ─── Advanced ───
+grpAdv = "Advanced"
+i_eqTolerance   = input.float(0.15, "EQH/EQL Tolerance (%)", minval=0.05, maxval=0.50, step=0.01, group=grpAdv)
+i_obImpulse     = input.float(1.0, "OB Impulse Threshold (ATR×)", minval=0.5, maxval=2.0, step=0.1, group=grpAdv)
+i_pivotBars     = input.int(2, "Swing Pivot Bars", minval=2, maxval=5, group=grpAdv)
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION A.2 — CONSTANTS AND CORE CALCULATIONS
+// ══════════════════════════════════════════════════════════════
+
+// ─── Colors ───
+color C_BULL        = color.green
+color C_BEAR        = color.red
+color C_CHOCH       = color.yellow
+color C_OB_BULL     = color.new(color.green, 80)
+color C_OB_BEAR     = color.new(color.red, 80)
+color C_FVG_BULL    = color.new(color.blue, 85)
+color C_FVG_BEAR    = color.new(color.blue, 85)
+color C_LIQ         = color.orange
+color C_PDH_PDL     = color.new(color.orange, 20)
+color C_PWH_PWL     = color.purple
+color C_ASIAN       = color.new(color.gray, 90)
+color C_MITIGATED   = color.new(color.gray, 70)
+color C_TP1         = color.new(color.green, 40)
+color C_TP2         = color.new(color.green, 20)
+color C_TP3         = color.new(color.green, 60)
+color C_NEUTRAL     = color.gray
+
+// ─── Core Indicators ───
+float atr14         = ta.atr(14)
+float rsi14         = ta.rsi(close, 14)
+float ema21         = ta.ema(close, 21)
+float ema50         = ta.ema(close, 50)
+
+// ─── HTF Data ───
+htfTF = timeframe.period == "15" ? "60" : "240"
+[htf_ema21, htf_ema50] = request.security(syminfo.tickerid, htfTF, [ta.ema(close, 21), ta.ema(close, 50)], barmerge.gaps_off, barmerge.lookahead_off)
+
+// ─── Session Detection ───
+utcHour     = hour(time, "UTC")
+inLondon    = utcHour >= 7 and utcHour < 10
+inNewYork   = utcHour >= 13 and utcHour < 16
+inAsian     = utcHour >= 0 and utcHour < 8
+sessionActive = inLondon or inNewYork
+
+
+// ─── Helper Functions ───
+f_isConfirmedBar() => barstate.isconfirmed
+
+f_bodySize() => math.abs(close - open)
+
+f_candleRange() => high - low
+
+f_upperWick() => close > open ? high - close : high - open
+
+f_lowerWick() => close > open ? open - low : close - low
+
+f_isBullishEngulfing() =>
+    body = f_bodySize()
+    rng = f_candleRange()
+    rng > 0 and close > open[1] and body > 0.6 * rng and close > high - 0.3 * rng and close > open
+
+f_isHammer() =>
+    body = f_bodySize()
+    lw = f_lowerWick()
+    rng = f_candleRange()
+    rng > 0 and lw > 2.0 * body and close > (high + low) / 2 and close > open
+
+f_isBearishEngulfing() =>
+    body = f_bodySize()
+    rng = f_candleRange()
+    rng > 0 and close < open[1] and body > 0.6 * rng and close < low + 0.3 * rng and close < open
+
+f_isShootingStar() =>
+    body = f_bodySize()
+    uw = f_upperWick()
+    rng = f_candleRange()
+    rng > 0 and uw > 2.0 * body and close < (high + low) / 2 and close < open
+
+f_pctDist(float a, float b) => math.abs(a - b) / math.max(a, 1) * 100
+
+// ─── Daily Signal Counter ───
+var int signalsToday = 0
+var int lastResetDay = 0
+currentDay = dayofmonth(time, "UTC")
+if currentDay != lastResetDay
+    signalsToday := 0
+    lastResetDay := currentDay
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION B — MARKET STRUCTURE ENGINE
+// ══════════════════════════════════════════════════════════════
+
+// ─── Swing Point Detection (confirmed pivots with offset) ───
+swingHigh = ta.pivothigh(high, i_pivotBars, i_pivotBars)
+swingLow  = ta.pivotlow(low, i_pivotBars, i_pivotBars)
+
+// ─── Track Swing History ───
+var float sh_1 = na       // most recent swing high
+var float sh_2 = na       // previous swing high
+var int   sh_1_bar = na   // bar index of most recent SH
+var int   sh_2_bar = na   // bar index of previous SH
+var float sl_1 = na       // most recent swing low
+var float sl_2 = na       // previous swing low
+var int   sl_1_bar = na   // bar index of most recent SL
+var int   sl_2_bar = na   // bar index of previous SL
+
+if not na(swingHigh)
+    sh_2 := sh_1
+    sh_2_bar := sh_1_bar
+    sh_1 := swingHigh
+    sh_1_bar := bar_index - i_pivotBars
+
+if not na(swingLow)
+    sl_2 := sl_1
+    sl_2_bar := sl_1_bar
+    sl_1 := swingLow
+    sl_1_bar := bar_index - i_pivotBars
+
+
+// ─── Structure Classification ───
+// 1 = BULLISH, -1 = BEARISH, 0 = RANGING/CHOP
+var int structureBias = 0
+var int prevStructureBias = 0
+
+bool hasHH = not na(sh_1) and not na(sh_2) and sh_1 > sh_2
+bool hasHL = not na(sl_1) and not na(sl_2) and sl_1 > sl_2
+bool hasLH = not na(sh_1) and not na(sh_2) and sh_1 < sh_2
+bool hasLL = not na(sl_1) and not na(sl_2) and sl_1 < sl_2
+
+int newBias = hasHH and hasHL ? 1 : hasLH and hasLL ? -1 : 0
+
+if newBias != structureBias and newBias != 0
+    prevStructureBias := structureBias
+    structureBias := newBias
+
+
+// ─── Break of Structure (BOS) & Change of Character (CHoCH) Detection ───
+var bool bosUp       = false
+var bool bosDn       = false
+var bool chochUp     = false
+var bool chochDn     = false
+var float bosLevel   = na
+var float chochLevel = na
+var int bosBar       = na
+var int chochBar     = na
+
+// Track consecutive structure count for CHoCH detection
+var int bullCount = 0  // consecutive bullish structure swings
+var int bearCount = 0  // consecutive bearish structure swings
+
+if not na(swingHigh)
+    if hasHH
+        bullCount := bullCount + 1
+        bearCount := 0
+    if hasLH
+        bearCount := bearCount + 1
+        bullCount := 0
+
+if not na(swingLow)
+    if hasHL
+        bullCount := bullCount + 1
+        bearCount := 0
+    if hasLL
+        bearCount := bearCount + 1
+        bullCount := 0
+
+// Reset detection flags each bar
+bosUp := false
+bosDn := false
+chochUp := false
+chochDn := false
+
+// Bullish BOS/CHoCH: close above previous swing high
+if f_isConfirmedBar() and not na(sh_1) and close > sh_1
+    if prevStructureBias == -1 and bearCount >= 2 and structureBias != 1
+        // First counter-trend break after sustained bearish = CHoCH
+        chochUp := true
+        chochLevel := sh_1
+        chochBar := bar_index
+    else if structureBias == 1 or structureBias == 0
+        bosUp := true
+        bosLevel := sh_1
+        bosBar := bar_index
+
+// Bearish BOS/CHoCH: close below previous swing low
+if f_isConfirmedBar() and not na(sl_1) and close < sl_1
+    if prevStructureBias == 1 and bullCount >= 2 and structureBias != -1
+        // First counter-trend break after sustained bullish = CHoCH
+        chochDn := true
+        chochLevel := sl_1
+        chochBar := bar_index
+    else if structureBias == -1 or structureBias == 0
+        bosDn := true
+        bosLevel := sl_1
+        bosBar := bar_index
+
+
+// ─── BOS/CHoCH Persistent State for Signal Logic ───
+var bool hasBullBOS = false   // at least one bullish BOS has occurred
+var bool hasBearBOS = false   // at least one bearish BOS has occurred
+var float lastBullBOSLevel = na
+var float lastBearBOSLevel = na
+var int lastBullBOSBar = na
+var int lastBearBOSBar = na
+
+if bosUp or chochUp
+    hasBullBOS := true
+    lastBullBOSLevel := nz(bosLevel, chochLevel)
+    lastBullBOSBar := bar_index
+    hasBearBOS := false
+
+if bosDn or chochDn
+    hasBearBOS := true
+    lastBearBOSLevel := nz(bosLevel, chochLevel)
+    lastBearBOSBar := bar_index
+    hasBullBOS := false
+
+// ─── Structure Drawing Arrays (managed for max count) ───
+var line[] structureLines = array.new_line()
+var label[] structureLabels = array.new_label()
+int MAX_STRUCT_LINES = 10
+
+// Draw BOS lines and labels
+if bosUp and i_showStructure
+    ln = line.new(bar_index - 10, bosLevel, bar_index, bosLevel, color=C_BULL, style=line.style_dashed, width=1)
+    lb = label.new(bar_index, bosLevel, "BOS ↑", color=color.new(color.green, 100), textcolor=C_BULL, style=label.style_label_down, size=size.small)
+    array.push(structureLines, ln)
+    array.push(structureLabels, lb)
+
+if bosDn and i_showStructure
+    ln = line.new(bar_index - 10, bosLevel, bar_index, bosLevel, color=C_BEAR, style=line.style_dashed, width=1)
+    lb = label.new(bar_index, bosLevel, "BOS ↓", color=color.new(color.red, 100), textcolor=C_BEAR, style=label.style_label_up, size=size.small)
+    array.push(structureLines, ln)
+    array.push(structureLabels, lb)
+
+if chochUp and i_showStructure
+    ln = line.new(bar_index - 10, chochLevel, bar_index, chochLevel, color=C_CHOCH, style=line.style_dashed, width=1)
+    lb = label.new(bar_index, chochLevel, "CHoCH ↑", color=color.new(color.yellow, 100), textcolor=C_CHOCH, style=label.style_label_down, size=size.small)
+    array.push(structureLines, ln)
+    array.push(structureLabels, lb)
+
+if chochDn and i_showStructure
+    ln = line.new(bar_index - 10, chochLevel, bar_index, chochLevel, color=C_CHOCH, style=line.style_dashed, width=1)
+    lb = label.new(bar_index, chochLevel, "CHoCH ↓", color=color.new(color.yellow, 100), textcolor=C_CHOCH, style=label.style_label_up, size=size.small)
+    array.push(structureLines, ln)
+    array.push(structureLabels, lb)
+
+// Cleanup old structure drawings
+if array.size(structureLines) > MAX_STRUCT_LINES
+    line.delete(array.shift(structureLines))
+    label.delete(array.shift(structureLabels))
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION C — LIQUIDITY MAPPING
+// ══════════════════════════════════════════════════════════════
+
+// ─── C.1: Equal Highs / Equal Lows Detection ───
+var float[] swingHighArr = array.new_float()
+var int[]   swingHighBarArr = array.new_int()
+var float[] swingLowArr  = array.new_float()
+var int[]   swingLowBarArr  = array.new_int()
+
+// Store recent swing points for EQ detection
+if not na(swingHigh)
+    array.push(swingHighArr, swingHigh)
+    array.push(swingHighBarArr, bar_index - i_pivotBars)
+    if array.size(swingHighArr) > 20
+        array.shift(swingHighArr)
+        array.shift(swingHighBarArr)
+
+if not na(swingLow)
+    array.push(swingLowArr, swingLow)
+    array.push(swingLowBarArr, bar_index - i_pivotBars)
+    if array.size(swingLowArr) > 20
+        array.shift(swingLowArr)
+        array.shift(swingLowBarArr)
+
+// EQH/EQL state
+var float eqhLevel = na
+var float eqlLevel = na
+var int   eqhBar1 = na
+var int   eqhBar2 = na
+var int   eqlBar1 = na
+var int   eqlBar2 = na
+var bool  newEQH  = false
+var bool  newEQL  = false
+
+
+newEQH := false
+newEQL := false
+
+// Detect Equal Highs (compare latest swing high to previous ones)
+if not na(swingHigh) and array.size(swingHighArr) >= 2
+    float tolerance = i_eqTolerance / 100.0
+    int sz = array.size(swingHighArr)
+    float latest = array.get(swingHighArr, sz - 1)
+    for i = 0 to sz - 2
+        float prev = array.get(swingHighArr, i)
+        if math.abs(latest - prev) / latest <= tolerance
+            eqhLevel := math.max(latest, prev)
+            eqhBar1 := array.get(swingHighBarArr, i)
+            eqhBar2 := array.get(swingHighBarArr, sz - 1)
+            newEQH := true
+            break
+
+// Detect Equal Lows (compare latest swing low to previous ones)
+if not na(swingLow) and array.size(swingLowArr) >= 2
+    float tolerance = i_eqTolerance / 100.0
+    int sz = array.size(swingLowArr)
+    float latest = array.get(swingLowArr, sz - 1)
+    for i = 0 to sz - 2
+        float prev = array.get(swingLowArr, i)
+        if math.abs(latest - prev) / latest <= tolerance
+            eqlLevel := math.min(latest, prev)
+            eqlBar1 := array.get(swingLowBarArr, i)
+            eqlBar2 := array.get(swingLowBarArr, sz - 1)
+            newEQL := true
+            break
+
+
+// ─── C.2: EQH/EQL Drawing ───
+var line[] eqhLines = array.new_line()
+var label[] eqhLabels = array.new_label()
+var line[] eqlLines = array.new_line()
+var label[] eqlLabels = array.new_label()
+int MAX_EQ_LINES = 3
+
+if newEQH and i_showLiq
+    ln = line.new(eqhBar1, eqhLevel, bar_index + 20, eqhLevel, color=C_LIQ, style=line.style_dotted, width=1)
+    lb = label.new(bar_index + 20, eqhLevel, "EQH 💧", color=color.new(color.orange, 100), textcolor=C_LIQ, style=label.style_label_left, size=size.tiny)
+    array.push(eqhLines, ln)
+    array.push(eqhLabels, lb)
+    if array.size(eqhLines) > MAX_EQ_LINES
+        line.delete(array.shift(eqhLines))
+        label.delete(array.shift(eqhLabels))
+
+if newEQL and i_showLiq
+    ln = line.new(eqlBar1, eqlLevel, bar_index + 20, eqlLevel, color=C_LIQ, style=line.style_dotted, width=1)
+    lb = label.new(bar_index + 20, eqlLevel, "EQL 💧", color=color.new(color.orange, 100), textcolor=C_LIQ, style=label.style_label_left, size=size.tiny)
+    array.push(eqlLines, ln)
+    array.push(eqlLabels, lb)
+    if array.size(eqlLines) > MAX_EQ_LINES
+        line.delete(array.shift(eqlLines))
+        label.delete(array.shift(eqlLabels))
+
+
+// ─── C.3: Previous Day High/Low (PDH/PDL) ───
+var float pdh = na
+var float pdl = na
+var float currDayHigh = na
+var float currDayLow  = na
+var int   currDayStart = na
+
+newDay = ta.change(time("D")) != 0
+if newDay
+    pdh := currDayHigh
+    pdl := currDayLow
+    currDayHigh := high
+    currDayLow  := low
+    currDayStart := bar_index
+else
+    currDayHigh := math.max(nz(currDayHigh, high), high)
+    currDayLow  := math.min(nz(currDayLow, low), low)
+
+// ─── C.4: Previous Week High/Low (PWH/PWL) ───
+var float pwh = na
+var float pwl = na
+var float currWeekHigh = na
+var float currWeekLow  = na
+
+newWeek = ta.change(time("W")) != 0
+if newWeek
+    pwh := currWeekHigh
+    pwl := currWeekLow
+    currWeekHigh := high
+    currWeekLow  := low
+else
+    currWeekHigh := math.max(nz(currWeekHigh, high), high)
+    currWeekLow  := math.min(nz(currWeekLow, low), low)
+
+
+// ─── C.5: PDH/PDL/PWH/PWL Drawing (extend right) ───
+var line pdhLine = na
+var line pdlLine = na
+var line pwhLine = na
+var line pwlLine = na
+var label pdhLbl = na
+var label pdlLbl = na
+var label pwhLbl = na
+var label pwlLbl = na
+
+if i_showLiq and not na(pdh)
+    if not na(pdhLine)
+        line.set_x2(pdhLine, bar_index)
+        label.set_x(pdhLbl, bar_index)
+    else
+        pdhLine := line.new(bar_index - 1, pdh, bar_index, pdh, color=C_PDH_PDL, style=line.style_solid, width=1, extend=extend.right)
+        pdhLbl  := label.new(bar_index, pdh, "PDH", color=color.new(color.orange, 100), textcolor=C_PDH_PDL, style=label.style_label_left, size=size.tiny)
+    if newDay
+        line.delete(pdhLine)
+        label.delete(pdhLbl)
+        pdhLine := line.new(bar_index, pdh, bar_index, pdh, color=C_PDH_PDL, style=line.style_solid, width=1, extend=extend.right)
+        pdhLbl  := label.new(bar_index, pdh, "PDH", color=color.new(color.orange, 100), textcolor=C_PDH_PDL, style=label.style_label_left, size=size.tiny)
+
+if i_showLiq and not na(pdl)
+    if not na(pdlLine)
+        line.set_x2(pdlLine, bar_index)
+        label.set_x(pdlLbl, bar_index)
+    else
+        pdlLine := line.new(bar_index - 1, pdl, bar_index, pdl, color=C_PDH_PDL, style=line.style_solid, width=1, extend=extend.right)
+        pdlLbl  := label.new(bar_index, pdl, "PDL", color=color.new(color.orange, 100), textcolor=C_PDH_PDL, style=label.style_label_left, size=size.tiny)
+    if newDay
+        line.delete(pdlLine)
+        label.delete(pdlLbl)
+        pdlLine := line.new(bar_index, pdl, bar_index, pdl, color=C_PDH_PDL, style=line.style_solid, width=1, extend=extend.right)
+        pdlLbl  := label.new(bar_index, pdl, "PDL", color=color.new(color.orange, 100), textcolor=C_PDH_PDL, style=label.style_label_left, size=size.tiny)
+
+
+if i_showLiq and not na(pwh)
+    if not na(pwhLine)
+        line.set_x2(pwhLine, bar_index)
+        label.set_x(pwhLbl, bar_index)
+    else
+        pwhLine := line.new(bar_index - 1, pwh, bar_index, pwh, color=C_PWH_PWL, style=line.style_solid, width=2, extend=extend.right)
+        pwhLbl  := label.new(bar_index, pwh, "PWH", color=color.new(color.purple, 100), textcolor=C_PWH_PWL, style=label.style_label_left, size=size.tiny)
+    if newWeek
+        line.delete(pwhLine)
+        label.delete(pwhLbl)
+        pwhLine := line.new(bar_index, pwh, bar_index, pwh, color=C_PWH_PWL, style=line.style_solid, width=2, extend=extend.right)
+        pwhLbl  := label.new(bar_index, pwh, "PWH", color=color.new(color.purple, 100), textcolor=C_PWH_PWL, style=label.style_label_left, size=size.tiny)
+
+if i_showLiq and not na(pwl)
+    if not na(pwlLine)
+        line.set_x2(pwlLine, bar_index)
+        label.set_x(pwlLbl, bar_index)
+    else
+        pwlLine := line.new(bar_index - 1, pwl, bar_index, pwl, color=C_PWH_PWL, style=line.style_solid, width=2, extend=extend.right)
+        pwlLbl  := label.new(bar_index, pwl, "PWL", color=color.new(color.purple, 100), textcolor=C_PWH_PWL, style=label.style_label_left, size=size.tiny)
+    if newWeek
+        line.delete(pwlLine)
+        label.delete(pwlLbl)
+        pwlLine := line.new(bar_index, pwl, bar_index, pwl, color=C_PWH_PWL, style=line.style_solid, width=2, extend=extend.right)
+        pwlLbl  := label.new(bar_index, pwl, "PWL", color=color.new(color.purple, 100), textcolor=C_PWH_PWL, style=label.style_label_left, size=size.tiny)
+
+
+// ─── C.6: Asian Session Range (00:00–08:00 UTC) ───
+var float asianHigh = na
+var float asianLow  = na
+var int   asianStartBar = na
+var bool  asianComplete = false
+var box   asianBox = na
+var label asianHiLbl = na
+var label asianLoLbl = na
+
+bool isAsianHour = utcHour >= 0 and utcHour < 8
+bool wasAsianHour = hour(time[1], "UTC") >= 0 and hour(time[1], "UTC") < 8
+
+// New Asian session start
+if isAsianHour and not wasAsianHour
+    asianHigh := high
+    asianLow  := low
+    asianStartBar := bar_index
+    asianComplete := false
+    // Delete previous session box
+    if not na(asianBox)
+        box.delete(asianBox)
+        label.delete(asianHiLbl)
+        label.delete(asianLoLbl)
+    asianBox := na
+    asianHiLbl := na
+    asianLoLbl := na
+
+// During Asian session, track high/low
+if isAsianHour
+    asianHigh := math.max(nz(asianHigh, high), high)
+    asianLow  := math.min(nz(asianLow, low), low)
+
+// Asian session just ended — draw the box
+if not isAsianHour and wasAsianHour and not asianComplete
+    asianComplete := true
+    if i_showAsian and not na(asianHigh) and not na(asianLow)
+        asianBox := box.new(asianStartBar, asianHigh, bar_index - 1, asianLow, border_color=color.new(color.gray, 50), bgcolor=C_ASIAN, border_width=1, border_style=line.style_dotted)
+        asianHiLbl := label.new(bar_index - 1, asianHigh, "Asia Hi", color=color.new(color.gray, 100), textcolor=color.gray, style=label.style_label_left, size=size.tiny)
+        asianLoLbl := label.new(bar_index - 1, asianLow, "Asia Lo", color=color.new(color.gray, 100), textcolor=color.gray, style=label.style_label_left, size=size.tiny)
+
+
+// ─── C.7: Inducement (IDM) Detection ───
+// IDM = the last minor swing high/low BEFORE a BOS that acted as bait
+var float idmLevel = na
+var int   idmBar   = na
+var int   idmDir   = 0   // 1 = above (bull IDM), -1 = below (bear IDM)
+var label idmLbl   = na
+
+// When bullish BOS occurs, the last swing low before it = IDM (bait for shorts)
+if bosUp or chochUp
+    if not na(sl_1) and sl_1_bar < bar_index
+        idmLevel := sl_1
+        idmBar := sl_1_bar
+        idmDir := -1
+        if i_showLiq
+            if not na(idmLbl)
+                label.delete(idmLbl)
+            idmLbl := label.new(sl_1_bar, sl_1, "IDM ▼", color=color.new(color.white, 100), textcolor=color.white, style=label.style_label_up, size=size.tiny)
+
+// When bearish BOS occurs, the last swing high before it = IDM (bait for longs)
+if bosDn or chochDn
+    if not na(sh_1) and sh_1_bar < bar_index
+        idmLevel := sh_1
+        idmBar := sh_1_bar
+        idmDir := 1
+        if i_showLiq
+            if not na(idmLbl)
+                label.delete(idmLbl)
+            idmLbl := label.new(sh_1_bar, sh_1, "IDM ▲", color=color.new(color.white, 100), textcolor=color.white, style=label.style_label_down, size=size.tiny)
+
+// ─── C.8: Liquidity Sweep Detection (used by signal engine) ───
+// Bullish sweep: wick below EQL or recent swing low, close recovers above
+var bool bullSweep = false
+var float bullSweepLevel = na
+
+// Bearish sweep: wick above EQH or recent swing high, close recovers below
+var bool bearSweep = false
+var float bearSweepLevel = na
+
+bullSweep := false
+bearSweep := false
+
+// Check sweep of EQL
+if not na(eqlLevel) and low < eqlLevel and close > eqlLevel
+    bullSweep := true
+    bullSweepLevel := eqlLevel
+
+// Check sweep of recent swing lows (within 20 bars)
+if not bullSweep and not na(sl_1) and low < sl_1 and close > sl_1 and (bar_index - nz(sl_1_bar, 0)) < 50
+    bullSweep := true
+    bullSweepLevel := sl_1
+
+// Check sweep of Asian session low
+if not bullSweep and asianComplete and not na(asianLow) and low < asianLow and close > asianLow
+    bullSweep := true
+    bullSweepLevel := asianLow
+
+// Check sweep of EQH
+if not na(eqhLevel) and high > eqhLevel and close < eqhLevel
+    bearSweep := true
+    bearSweepLevel := eqhLevel
+
+// Check sweep of recent swing highs
+if not bearSweep and not na(sh_1) and high > sh_1 and close < sh_1 and (bar_index - nz(sh_1_bar, 0)) < 50
+    bearSweep := true
+    bearSweepLevel := sh_1
+
+// Check sweep of Asian session high
+if not bearSweep and asianComplete and not na(asianHigh) and high > asianHigh and close < asianHigh
+    bearSweep := true
+    bearSweepLevel := asianHigh
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION D — ORDER BLOCK & FVG DETECTION
+// ══════════════════════════════════════════════════════════════
+
+// ─── D.1: Order Block Data Structure (UDT) ───
+type OrderBlock
+    float top
+    float bottom
+    int   startBar
+    int   dir        // 1 = bullish OB, -1 = bearish OB
+    bool  mitigated
+    bool  active     // price has touched but not broken through
+    box   bx
+
+type FVG
+    float top
+    float bottom
+    int   startBar
+    int   dir        // 1 = bullish FVG, -1 = bearish FVG
+    bool  mitigated
+    box   bx
+
+// ─── D.2: OB Storage Arrays ───
+var OrderBlock[] bullOBs = array.new<OrderBlock>()
+var OrderBlock[] bearOBs = array.new<OrderBlock>()
+var FVG[] bullFVGs = array.new<FVG>()
+var FVG[] bearFVGs = array.new<FVG>()
+
+int MAX_OBS = 5
+int MAX_FVGS = 3
+
+
+// ─── D.3: Bullish Order Block Detection ───
+// Trigger: Bullish BOS occurs AND impulse body >= threshold × ATR
+// OB = last bearish (red) candle before the impulse
+var bool newBullOB = false
+newBullOB := false
+
+if (bosUp or chochUp) and f_isConfirmedBar()
+    // Check impulse candle (current candle that caused BOS)
+    float impulseBody = math.abs(close - open)
+    if impulseBody >= i_obImpulse * atr14
+        // Find the last bearish candle before this impulse (look back up to 10 bars)
+        int obBarIdx = na
+        for i = 1 to 10
+            if close[i] < open[i]  // bearish candle
+                obBarIdx := i
+                break
+        if not na(obBarIdx)
+            float obTop = open[obBarIdx]
+            float obBot = low[obBarIdx]
+            int obStart = bar_index - obBarIdx
+            // Create OB box
+            box obBox = na
+            if i_showOB
+                obBox := box.new(obStart, obTop, bar_index + 50, obBot, border_color=color.green, bgcolor=C_OB_BULL, border_width=1, border_style=line.style_solid)
+            // Store OB
+            OrderBlock newOB = OrderBlock.new(obTop, obBot, obStart, 1, false, false, obBox)
+            array.push(bullOBs, newOB)
+            newBullOB := true
+            // Enforce max limit
+            if array.size(bullOBs) > MAX_OBS
+                OrderBlock oldest = array.shift(bullOBs)
+                if not na(oldest.bx)
+                    box.delete(oldest.bx)
+
+
+// ─── D.4: Bearish Order Block Detection ───
+// Trigger: Bearish BOS occurs AND impulse body >= threshold × ATR
+// OB = last bullish (green) candle before the impulse
+var bool newBearOB = false
+newBearOB := false
+
+if (bosDn or chochDn) and f_isConfirmedBar()
+    float impulseBody = math.abs(close - open)
+    if impulseBody >= i_obImpulse * atr14
+        int obBarIdx = na
+        for i = 1 to 10
+            if close[i] > open[i]  // bullish candle
+                obBarIdx := i
+                break
+        if not na(obBarIdx)
+            float obTop = high[obBarIdx]
+            float obBot = open[obBarIdx]
+            int obStart = bar_index - obBarIdx
+            box obBox = na
+            if i_showOB
+                obBox := box.new(obStart, obTop, bar_index + 50, obBot, border_color=color.red, bgcolor=C_OB_BEAR, border_width=1, border_style=line.style_solid)
+            OrderBlock newOB = OrderBlock.new(obTop, obBot, obStart, -1, false, false, obBox)
+            array.push(bearOBs, newOB)
+            newBearOB := true
+            if array.size(bearOBs) > MAX_OBS
+                OrderBlock oldest = array.shift(bearOBs)
+                if not na(oldest.bx)
+                    box.delete(oldest.bx)
+
+
+// ─── D.5: Order Block Mitigation Logic ───
+// Active: price touches OB zone (enters it)
+// Mitigated: price trades completely through the OB
+
+// Process Bullish OBs
+if array.size(bullOBs) > 0
+    for i = array.size(bullOBs) - 1 to 0
+        OrderBlock ob = array.get(bullOBs, i)
+        if ob.mitigated
+            continue
+        // Extend box right edge
+        if not na(ob.bx) and i_showOB
+            box.set_right(ob.bx, bar_index + 1)
+        // Check if price entered OB zone (active)
+        if low <= ob.top and close >= ob.bottom and not ob.active
+            ob.active := true
+            if not na(ob.bx) and i_showOB
+                box.set_border_style(ob.bx, line.style_solid)
+                box.set_border_width(ob.bx, 2)
+            array.set(bullOBs, i, ob)
+        // Check if fully mitigated (price closed below OB bottom)
+        if close < ob.bottom
+            ob.mitigated := true
+            if not na(ob.bx) and i_showOB
+                box.set_bgcolor(ob.bx, C_MITIGATED)
+                box.set_border_color(ob.bx, color.gray)
+            array.set(bullOBs, i, ob)
+
+// Process Bearish OBs
+if array.size(bearOBs) > 0
+    for i = array.size(bearOBs) - 1 to 0
+        OrderBlock ob = array.get(bearOBs, i)
+        if ob.mitigated
+            continue
+        if not na(ob.bx) and i_showOB
+            box.set_right(ob.bx, bar_index + 1)
+        // Check if price entered OB zone (active)
+        if high >= ob.bottom and close <= ob.top and not ob.active
+            ob.active := true
+            if not na(ob.bx) and i_showOB
+                box.set_border_style(ob.bx, line.style_solid)
+                box.set_border_width(ob.bx, 2)
+            array.set(bearOBs, i, ob)
+        // Check if fully mitigated (price closed above OB top)
+        if close > ob.top
+            ob.mitigated := true
+            if not na(ob.bx) and i_showOB
+                box.set_bgcolor(ob.bx, C_MITIGATED)
+                box.set_border_color(ob.bx, color.gray)
+            array.set(bearOBs, i, ob)
+
+
+// ─── D.6: Fair Value Gap (FVG) Detection ───
+// Bullish FVG: low[0] > high[2] (gap between candle 1 high and candle 3 low)
+// Bearish FVG: high[0] < low[2] (gap between candle 1 low and candle 3 high)
+
+bool bullFVGDetected = low > high[2] and (low - high[2]) > 0
+bool bearFVGDetected = high < low[2] and (low[2] - high) > 0
+
+if bullFVGDetected and f_isConfirmedBar()
+    float fvgTop = low
+    float fvgBot = high[2]
+    box fvgBox = na
+    if i_showFVG
+        fvgBox := box.new(bar_index - 2, fvgTop, bar_index + 30, fvgBot, border_color=color.new(color.blue, 60), bgcolor=C_FVG_BULL, border_width=1, border_style=line.style_dotted)
+    FVG newFvg = FVG.new(fvgTop, fvgBot, bar_index - 2, 1, false, fvgBox)
+    array.push(bullFVGs, newFvg)
+    if array.size(bullFVGs) > MAX_FVGS
+        FVG oldest = array.shift(bullFVGs)
+        if not na(oldest.bx)
+            box.delete(oldest.bx)
+
+if bearFVGDetected and f_isConfirmedBar()
+    float fvgTop = low[2]
+    float fvgBot = high
+    box fvgBox = na
+    if i_showFVG
+        fvgBox := box.new(bar_index - 2, fvgTop, bar_index + 30, fvgBot, border_color=color.new(color.blue, 60), bgcolor=C_FVG_BEAR, border_width=1, border_style=line.style_dotted)
+    FVG newFvg = FVG.new(fvgTop, fvgBot, bar_index - 2, -1, false, fvgBox)
+    array.push(bearFVGs, newFvg)
+    if array.size(bearFVGs) > MAX_FVGS
+        FVG oldest = array.shift(bearFVGs)
+        if not na(oldest.bx)
+            box.delete(oldest.bx)
+
+
+// ─── D.7: FVG Mitigation Logic ───
+// FVG is mitigated when price fills the gap completely
+
+if array.size(bullFVGs) > 0
+    for i = array.size(bullFVGs) - 1 to 0
+        FVG fvg = array.get(bullFVGs, i)
+        if fvg.mitigated
+            continue
+        // Extend box
+        if not na(fvg.bx) and i_showFVG
+            box.set_right(fvg.bx, bar_index + 1)
+        // Mitigated when price fills gap (close drops below FVG bottom)
+        if close < fvg.bottom
+            fvg.mitigated := true
+            if not na(fvg.bx) and i_showFVG
+                box.set_bgcolor(fvg.bx, C_MITIGATED)
+                box.set_border_color(fvg.bx, color.gray)
+            array.set(bullFVGs, i, fvg)
+
+if array.size(bearFVGs) > 0
+    for i = array.size(bearFVGs) - 1 to 0
+        FVG fvg = array.get(bearFVGs, i)
+        if fvg.mitigated
+            continue
+        if not na(fvg.bx) and i_showFVG
+            box.set_right(fvg.bx, bar_index + 1)
+        // Mitigated when price fills gap (close rises above FVG top)
+        if close > fvg.top
+            fvg.mitigated := true
+            if not na(fvg.bx) and i_showFVG
+                box.set_bgcolor(fvg.bx, C_MITIGATED)
+                box.set_border_color(fvg.bx, color.gray)
+            array.set(bearFVGs, i, fvg)
+
+// ─── D.8: Helper — Check if price is inside a valid (unmitigated) OB/FVG ───
+f_inBullOB() =>
+    bool result = false
+    float obBottom = na
+    float obTop = na
+    if array.size(bullOBs) > 0
+        for i = array.size(bullOBs) - 1 to 0
+            OrderBlock ob = array.get(bullOBs, i)
+            if not ob.mitigated and low <= ob.top and close >= ob.bottom
+                result := true
+                obBottom := ob.bottom
+                obTop := ob.top
+                break
+    [result, obTop, obBottom]
+
+f_inBearOB() =>
+    bool result = false
+    float obBottom = na
+    float obTop = na
+    if array.size(bearOBs) > 0
+        for i = array.size(bearOBs) - 1 to 0
+            OrderBlock ob = array.get(bearOBs, i)
+            if not ob.mitigated and high >= ob.bottom and close <= ob.top
+                result := true
+                obBottom := ob.bottom
+                obTop := ob.top
+                break
+    [result, obTop, obBottom]
+
+f_inBullFVG() =>
+    bool result = false
+    float fvgBottom = na
+    float fvgTop = na
+    if array.size(bullFVGs) > 0
+        for i = array.size(bullFVGs) - 1 to 0
+            FVG fvg = array.get(bullFVGs, i)
+            if not fvg.mitigated and low <= fvg.top and close >= fvg.bottom
+                result := true
+                fvgBottom := fvg.bottom
+                fvgTop := fvg.top
+                break
+    [result, fvgTop, fvgBottom]
+
+f_inBearFVG() =>
+    bool result = false
+    float fvgBottom = na
+    float fvgTop = na
+    if array.size(bearFVGs) > 0
+        for i = array.size(bearFVGs) - 1 to 0
+            FVG fvg = array.get(bearFVGs, i)
+            if not fvg.mitigated and high >= fvg.bottom and close <= fvg.top
+                result := true
+                fvgBottom := fvg.bottom
+                fvgTop := fvg.top
+                break
+    [result, fvgTop, fvgBottom]
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION E — SIGNAL CONFLUENCE ENGINE
+// ══════════════════════════════════════════════════════════════
+
+// ─── E.1: Signal State Variables ───
+var bool  longSignal     = false
+var bool  shortSignal    = false
+var float entryPrice     = na
+var float slPrice        = na
+var float tp1Price       = na
+var float tp2Price       = na
+var float tp3Price       = na
+var float slPct          = na
+var float slATRmult      = na
+var float posSize        = na
+var float leverageReq    = na
+var bool  pathClear      = true
+var int   signalDir      = 0     // 1 = last long, -1 = last short
+var bool  inTrade        = false
+var float tradeEntry     = na
+var float tradeSL        = na
+var float tradeTP1       = na
+var float tradeTP2       = na
+var float tradeTP3       = na
+var bool  tp1Hit         = false
+var bool  tp2Hit         = false
+var bool  slHit          = false
+
+// Reset per-bar signal flags
+longSignal  := false
+shortSignal := false
+
+
+// ─── E.2: Proximity Check — Is price within 0.3% of major HTF level? ───
+f_nearMajorLevel(float price) =>
+    float threshold = 0.003
+    bool nearPDH = not na(pdh) and math.abs(price - pdh) / price < threshold
+    bool nearPDL = not na(pdl) and math.abs(price - pdl) / price < threshold
+    bool nearPWH = not na(pwh) and math.abs(price - pwh) / price < threshold
+    bool nearPWL = not na(pwl) and math.abs(price - pwl) / price < threshold
+    nearPDH or nearPDL or nearPWH or nearPWL
+
+// ─── E.3: Path Clear Check — No major level between entry and TP2 ───
+f_pathClearLong(float entry, float target) =>
+    bool blocked = false
+    if not na(pdh) and pdh > entry and pdh < target
+        blocked := true
+    if not na(pwh) and pwh > entry and pwh < target
+        blocked := true
+    if not na(eqhLevel) and eqhLevel > entry and eqhLevel < target
+        blocked := true
+    // Check unmitigated bearish OBs in path
+    if array.size(bearOBs) > 0
+        for i = 0 to array.size(bearOBs) - 1
+            OrderBlock ob = array.get(bearOBs, i)
+            if not ob.mitigated and ob.bottom > entry and ob.bottom < target
+                blocked := true
+                break
+    not blocked
+
+f_pathClearShort(float entry, float target) =>
+    bool blocked = false
+    if not na(pdl) and pdl < entry and pdl > target
+        blocked := true
+    if not na(pwl) and pwl < entry and pwl > target
+        blocked := true
+    if not na(eqlLevel) and eqlLevel < entry and eqlLevel > target
+        blocked := true
+    if array.size(bullOBs) > 0
+        for i = 0 to array.size(bullOBs) - 1
+            OrderBlock ob = array.get(bullOBs, i)
+            if not ob.mitigated and ob.top < entry and ob.top > target
+                blocked := true
+                break
+    not blocked
+
+
+// ─── E.4: Find Nearest Liquidity Target for TP3 ───
+f_nearestLiqAbove(float minLevel) =>
+    float nearest = na
+    if not na(pdh) and pdh > minLevel
+        nearest := na(nearest) ? pdh : math.min(nearest, pdh)
+    if not na(pwh) and pwh > minLevel
+        nearest := na(nearest) ? pwh : math.min(nearest, pwh)
+    if not na(eqhLevel) and eqhLevel > minLevel
+        nearest := na(nearest) ? eqhLevel : math.min(nearest, eqhLevel)
+    if not na(sh_1) and sh_1 > minLevel
+        nearest := na(nearest) ? sh_1 : math.min(nearest, sh_1)
+    nearest
+
+f_nearestLiqBelow(float maxLevel) =>
+    float nearest = na
+    if not na(pdl) and pdl < maxLevel
+        nearest := na(nearest) ? pdl : math.max(nearest, pdl)
+    if not na(pwl) and pwl < maxLevel
+        nearest := na(nearest) ? pwl : math.max(nearest, pwl)
+    if not na(eqlLevel) and eqlLevel < maxLevel
+        nearest := na(nearest) ? eqlLevel : math.max(nearest, eqlLevel)
+    if not na(sl_1) and sl_1 < maxLevel
+        nearest := na(nearest) ? sl_1 : math.max(nearest, sl_1)
+    nearest
+
+
+// ─── E.5: LONG SIGNAL CONFLUENCE CHECK ───
+if f_isConfirmedBar() and not inTrade
+
+    // === CONDITION 1: Bullish Structure ===
+    bool c1_long = structureBias == 1
+
+    // === CONDITION 2: Price in valid Bullish OB or FVG ===
+    [inOB_l, obTop_l, obBot_l] = f_inBullOB()
+    [inFVG_l, fvgTop_l, fvgBot_l] = f_inBullFVG()
+    bool c2_long = inOB_l or inFVG_l
+    // Use FVG zone if inside OB+FVG overlap (premium), else OB zone
+    float entryZoneBot = inFVG_l and inOB_l ? fvgBot_l : inOB_l ? obBot_l : fvgBot_l
+
+    // === CONDITION 3: Liquidity Sweep ===
+    bool c3_long = bullSweep
+
+    // === CONDITION 4: Momentum ===
+    bool c4_long = rsi14 < 45 and ema21 > ema50
+
+    // === CONDITION 5: Candle Confirmation ===
+    bool c5_long = f_isBullishEngulfing() or f_isHammer()
+
+    // === CONDITION 6: Session Filter ===
+    bool c6_long = i_sessionFilter ? sessionActive : true
+
+    // === CONDITION 7: HTF Trend Filter ===
+    bool c7_long = i_htfFilter ? (htf_ema21 > htf_ema50) : true
+
+    // === ALL CONDITIONS MET? ===
+    if c1_long and c2_long and c3_long and c4_long and c5_long and c6_long and c7_long
+
+        // ─── INVALIDATION CHECKS ───
+        bool inv1 = not hasBullBOS                         // No BOS yet
+        bool inv2 = rsi14 > 70                             // RSI extended
+        bool inv3 = f_nearMajorLevel(close)                // Too close to major level
+        bool inv4 = i_newsFilter                           // News filter active
+        bool inv5 = signalsToday >= i_dailyLimit           // Daily limit reached
+
+        if not inv1 and not inv2 and not inv3 and not inv4 and not inv5
+
+            // ─── STOP LOSS CALCULATION ───
+            float sl_structure = entryZoneBot - (syminfo.mintick * 5)
+            float sl_sweep = nz(bullSweepLevel, entryZoneBot) - (syminfo.mintick * 5)
+            float sl_raw = math.min(sl_structure, math.min(sl_sweep, low))
+
+            float atr_min_stop = close - (0.8 * atr14)
+            float atr_max_stop = close - (2.0 * atr14 * i_atrMult)
+
+            float sl_calc = sl_raw
+            // Too tight? Use ATR floor
+            if sl_raw > atr_min_stop
+                sl_calc := atr_min_stop
+            // Too wide? Skip trade
+            bool skipWide = sl_raw < atr_max_stop
+
+            float stopDist = math.abs(close - sl_calc)
+            float stopPct = stopDist / close * 100
+            bool skipTight = stopPct < 0.4
+
+            if not skipWide and not skipTight
+                // ─── TAKE PROFIT CALCULATION ───
+                float tp1_calc = close + stopDist
+                float tp2_calc = close + (stopDist * 2.0)
+                float liqTarget = f_nearestLiqAbove(tp2_calc)
+                float tp3_calc = not na(liqTarget) ? liqTarget : close + (stopDist * 3.0)
+
+                // ─── PATH CLEAR? ───
+                bool pathOK = f_pathClearLong(close, tp2_calc)
+
+                // ─── LEVERAGE CHECK ───
+                float riskAmt = i_accountSize * (i_riskPercent / 100)
+                float posSz = riskAmt / stopDist
+                float notional = posSz * close
+                float levReq = notional / i_accountSize
+                bool levOK = levReq <= i_maxLeverage
+
+                if pathOK and levOK
+                    // ═══ FIRE LONG SIGNAL ═══
+                    longSignal  := true
+                    entryPrice  := close
+                    slPrice     := sl_calc
+                    tp1Price    := tp1_calc
+                    tp2Price    := tp2_calc
+                    tp3Price    := tp3_calc
+                    slPct       := stopPct
+                    slATRmult   := stopDist / atr14
+                    posSize     := posSz
+                    leverageReq := levReq
+                    pathClear   := true
+                    signalDir   := 1
+                    signalsToday += 1
+                    // Enter trade tracking
+                    inTrade     := true
+                    tradeEntry  := close
+                    tradeSL     := sl_calc
+                    tradeTP1    := tp1_calc
+                    tradeTP2    := tp2_calc
+                    tradeTP3    := tp3_calc
+                    tp1Hit      := false
+                    tp2Hit      := false
+                    slHit       := false
+
+
+// ─── E.6: SHORT SIGNAL CONFLUENCE CHECK ───
+if f_isConfirmedBar() and not inTrade
+
+    // === CONDITION 1: Bearish Structure ===
+    bool c1_short = structureBias == -1
+
+    // === CONDITION 2: Price in valid Bearish OB or FVG ===
+    [inOB_s, obTop_s, obBot_s] = f_inBearOB()
+    [inFVG_s, fvgTop_s, fvgBot_s] = f_inBearFVG()
+    bool c2_short = inOB_s or inFVG_s
+    float entryZoneTop = inFVG_s and inOB_s ? fvgTop_s : inOB_s ? obTop_s : fvgTop_s
+
+    // === CONDITION 3: Liquidity Sweep ===
+    bool c3_short = bearSweep
+
+    // === CONDITION 4: Momentum ===
+    bool c4_short = rsi14 > 55 and ema21 < ema50
+
+    // === CONDITION 5: Candle Confirmation ===
+    bool c5_short = f_isBearishEngulfing() or f_isShootingStar()
+
+    // === CONDITION 6: Session Filter ===
+    bool c6_short = i_sessionFilter ? sessionActive : true
+
+    // === CONDITION 7: HTF Trend Filter ===
+    bool c7_short = i_htfFilter ? (htf_ema21 < htf_ema50) : true
+
+    // === ALL CONDITIONS MET? ===
+    if c1_short and c2_short and c3_short and c4_short and c5_short and c6_short and c7_short
+
+        // ─── INVALIDATION CHECKS ───
+        bool inv1_s = not hasBearBOS
+        bool inv2_s = rsi14 < 30
+        bool inv3_s = f_nearMajorLevel(close)
+        bool inv4_s = i_newsFilter
+        bool inv5_s = signalsToday >= i_dailyLimit
+
+        if not inv1_s and not inv2_s and not inv3_s and not inv4_s and not inv5_s
+
+            // ─── STOP LOSS CALCULATION ───
+            float sl_structure_s = entryZoneTop + (syminfo.mintick * 5)
+            float sl_sweep_s = nz(bearSweepLevel, entryZoneTop) + (syminfo.mintick * 5)
+            float sl_raw_s = math.max(sl_structure_s, math.max(sl_sweep_s, high))
+
+            float atr_min_stop_s = close + (0.8 * atr14)
+            float atr_max_stop_s = close + (2.0 * atr14 * i_atrMult)
+
+            float sl_calc_s = sl_raw_s
+            if sl_raw_s < atr_min_stop_s
+                sl_calc_s := atr_min_stop_s
+            bool skipWide_s = sl_raw_s > atr_max_stop_s
+
+            float stopDist_s = math.abs(sl_calc_s - close)
+            float stopPct_s = stopDist_s / close * 100
+            bool skipTight_s = stopPct_s < 0.4
+
+            if not skipWide_s and not skipTight_s
+                // ─── TAKE PROFIT CALCULATION ───
+                float tp1_s = close - stopDist_s
+                float tp2_s = close - (stopDist_s * 2.0)
+                float liqTarget_s = f_nearestLiqBelow(tp2_s)
+                float tp3_s = not na(liqTarget_s) ? liqTarget_s : close - (stopDist_s * 3.0)
+
+                // ─── PATH CLEAR? ───
+                bool pathOK_s = f_pathClearShort(close, tp2_s)
+
+                // ─── LEVERAGE CHECK ───
+                float riskAmt_s = i_accountSize * (i_riskPercent / 100)
+                float posSz_s = riskAmt_s / stopDist_s
+                float notional_s = posSz_s * close
+                float levReq_s = notional_s / i_accountSize
+                bool levOK_s = levReq_s <= i_maxLeverage
+
+                if pathOK_s and levOK_s
+                    // ═══ FIRE SHORT SIGNAL ═══
+                    shortSignal := true
+                    entryPrice  := close
+                    slPrice     := sl_calc_s
+                    tp1Price    := tp1_s
+                    tp2Price    := tp2_s
+                    tp3Price    := tp3_s
+                    slPct       := stopPct_s
+                    slATRmult   := stopDist_s / atr14
+                    posSize     := posSz_s
+                    leverageReq := levReq_s
+                    pathClear   := true
+                    signalDir   := -1
+                    signalsToday += 1
+                    inTrade     := true
+                    tradeEntry  := close
+                    tradeSL     := sl_calc_s
+                    tradeTP1    := tp1_s
+                    tradeTP2    := tp2_s
+                    tradeTP3    := tp3_s
+                    tp1Hit      := false
+                    tp2Hit      := false
+                    slHit       := false
+
+
+// ─── E.7: Trade Tracking (TP/SL Hit Detection) ───
+var float paperPnL = 0.0
+
+if inTrade
+    if signalDir == 1  // Long trade tracking
+        // TP1 hit
+        if not tp1Hit and high >= tradeTP1
+            tp1Hit := true
+            tradeSL := tradeEntry  // Move stop to breakeven
+            paperPnL += (tradeTP1 - tradeEntry) * posSize * 0.50
+        // TP2 hit
+        if tp1Hit and not tp2Hit and high >= tradeTP2
+            tp2Hit := true
+            tradeSL := tradeTP1   // Move stop to TP1
+            paperPnL += (tradeTP2 - tradeEntry) * posSize * 0.35
+        // TP3 hit (runner)
+        if tp2Hit and high >= tradeTP3
+            paperPnL += (tradeTP3 - tradeEntry) * posSize * 0.15
+            inTrade := false
+        // Stop hit
+        if low <= tradeSL
+            if not tp1Hit
+                paperPnL -= (tradeEntry - tradeSL) * posSize
+            // If TP1 was hit, stop at BE or TP1 = no additional loss
+            inTrade := false
+            slHit := true
+
+    else if signalDir == -1  // Short trade tracking
+        // TP1 hit
+        if not tp1Hit and low <= tradeTP1
+            tp1Hit := true
+            tradeSL := tradeEntry  // Move stop to breakeven
+            paperPnL += (tradeEntry - tradeTP1) * posSize * 0.50
+        // TP2 hit
+        if tp1Hit and not tp2Hit and low <= tradeTP2
+            tp2Hit := true
+            tradeSL := tradeTP1
+            paperPnL += (tradeEntry - tradeTP2) * posSize * 0.35
+        // TP3 hit (runner)
+        if tp2Hit and low <= tradeTP3
+            paperPnL += (tradeEntry - tradeTP3) * posSize * 0.15
+            inTrade := false
+        // Stop hit
+        if high >= tradeSL
+            if not tp1Hit
+                paperPnL -= (tradeSL - tradeEntry) * posSize
+            inTrade := false
+            slHit := true
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION F — VISUAL RENDERING
+// ══════════════════════════════════════════════════════════════
+
+// ─── F.1: Signal Arrows and Labels ───
+var label[] signalLabels = array.new_label()
+int MAX_SIGNAL_LABELS = 5
+
+if longSignal
+    string slTxt = str.tostring(slPct, "#.##")
+    string lblText = "LONG ▲ | SL: " + slTxt + "% | TP2: 1:2"
+    label lb = label.new(bar_index, low, lblText, color=color.new(C_BULL, 20), textcolor=color.white, style=label.style_label_up, size=size.normal)
+    array.push(signalLabels, lb)
+    if array.size(signalLabels) > MAX_SIGNAL_LABELS
+        label.delete(array.shift(signalLabels))
+
+if shortSignal
+    string slTxt = str.tostring(slPct, "#.##")
+    string lblText = "SHORT ▼ | SL: " + slTxt + "% | TP2: 1:2"
+    label lb = label.new(bar_index, high, lblText, color=color.new(C_BEAR, 20), textcolor=color.white, style=label.style_label_down, size=size.normal)
+    array.push(signalLabels, lb)
+    if array.size(signalLabels) > MAX_SIGNAL_LABELS
+        label.delete(array.shift(signalLabels))
+
+// Signal triangles (plotshape)
+plotshape(longSignal, title="Long Signal", style=shape.triangleup, location=location.belowbar, color=C_BULL, size=size.large)
+plotshape(shortSignal, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=C_BEAR, size=size.large)
+
+
+// ─── F.2: TP/SL Lines (drawn on signal, updated on trade tracking) ───
+var line slLine  = na
+var line tp1Line = na
+var line tp2Line = na
+var line tp3Line = na
+var label slLbl  = na
+var label tp1Lbl = na
+var label tp2Lbl = na
+var label tp3Lbl = na
+
+if (longSignal or shortSignal) and i_showTPSL
+    // Delete previous lines
+    line.delete(slLine)
+    line.delete(tp1Line)
+    line.delete(tp2Line)
+    line.delete(tp3Line)
+    label.delete(slLbl)
+    label.delete(tp1Lbl)
+    label.delete(tp2Lbl)
+    label.delete(tp3Lbl)
+
+    int startX = bar_index
+    int endX = bar_index + 30
+
+    // Stop Loss
+    slLine := line.new(startX, slPrice, endX, slPrice, color=C_BEAR, style=line.style_solid, width=2)
+    slLbl  := label.new(endX, slPrice, "SL: $" + str.tostring(slPrice, "#.##") + " | " + str.tostring(slPct, "#.##") + "%", color=color.new(C_BEAR, 100), textcolor=C_BEAR, style=label.style_label_left, size=size.tiny)
+
+    // TP1
+    tp1Line := line.new(startX, tp1Price, endX, tp1Price, color=C_TP1, style=line.style_dashed, width=1)
+    tp1Lbl  := label.new(endX, tp1Price, "TP1 1:1 | 50% EXIT", color=color.new(C_TP1, 100), textcolor=C_TP1, style=label.style_label_left, size=size.tiny)
+
+    // TP2
+    tp2Line := line.new(startX, tp2Price, endX, tp2Price, color=C_TP2, style=line.style_solid, width=1)
+    tp2Lbl  := label.new(endX, tp2Price, "TP2 1:2 | 35% EXIT", color=color.new(C_TP2, 100), textcolor=C_TP2, style=label.style_label_left, size=size.tiny)
+
+    // TP3
+    tp3Line := line.new(startX, tp3Price, endX, tp3Price, color=C_TP3, style=line.style_dotted, width=1)
+    tp3Lbl  := label.new(endX, tp3Price, "TP3 Runner | 15%", color=color.new(C_TP3, 100), textcolor=C_TP3, style=label.style_label_left, size=size.tiny)
+
+// Update SL line when stop is moved (TP1 hit → BE, TP2 hit → TP1)
+if inTrade and i_showTPSL and not na(slLine)
+    line.set_y1(slLine, tradeSL)
+    line.set_y2(slLine, tradeSL)
+    line.set_x2(slLine, bar_index + 10)
+    label.set_y(slLbl, tradeSL)
+    label.set_x(slLbl, bar_index + 10)
+    if tp1Hit
+        label.set_text(slLbl, "SL → BE: $" + str.tostring(tradeSL, "#.##"))
+        line.set_color(slLine, color.new(color.orange, 0))
+
+// Clear lines when trade ends
+if not inTrade and not longSignal and not shortSignal and i_showTPSL
+    if not na(slLine) and slHit
+        line.set_x2(slLine, bar_index)
+        line.set_x2(tp1Line, bar_index)
+        line.set_x2(tp2Line, bar_index)
+        line.set_x2(tp3Line, bar_index)
+
+
+// ─── F.3: Candle Coloring ───
+// Green when inside bullish OB, Red when inside bearish OB, Grey in chop
+[inBullOBnow, _, _] = f_inBullOB()
+[inBearOBnow, _, _] = f_inBearOB()
+
+color candleColor = na
+if structureBias == 0
+    candleColor := C_NEUTRAL
+else if inBullOBnow
+    candleColor := C_BULL
+else if inBearOBnow
+    candleColor := C_BEAR
+else
+    candleColor := na  // Use default candle colors
+
+barcolor(candleColor)
+
+// ─── F.4: EMA Plots (subtle, for reference) ───
+plot(ema21, "EMA 21", color=color.new(color.blue, 70), linewidth=1)
+plot(ema50, "EMA 50", color=color.new(color.orange, 70), linewidth=1)
+
+// ─── F.5: Swing Point Markers ───
+plotshape(not na(swingHigh) and i_showStructure, title="Swing High", style=shape.circle, location=location.abovebar, color=color.new(C_BEAR, 50), size=size.tiny, offset=-i_pivotBars)
+plotshape(not na(swingLow) and i_showStructure, title="Swing Low", style=shape.circle, location=location.belowbar, color=color.new(C_BULL, 50), size=size.tiny, offset=-i_pivotBars)
+
+
+// ══════════════════════════════════════════════════════════════
+// SECTION G — ALERT CONDITIONS & DASHBOARD
+// ══════════════════════════════════════════════════════════════
+
+// ─── G.1: Alert Conditions ───
+// Long Signal Alert
+alertcondition(longSignal, title="LONG Signal Fired", message="🟢 LONG SIGNAL — {{ticker}} | Entry: {{close}} | SL: " + str.tostring(slPrice) + " (" + str.tostring(slPct, "#.##") + "%) | TP1: " + str.tostring(tp1Price) + " | TP2: " + str.tostring(tp2Price))
+
+// Short Signal Alert
+alertcondition(shortSignal, title="SHORT Signal Fired", message="🔴 SHORT SIGNAL — {{ticker}} | Entry: {{close}} | SL: " + str.tostring(slPrice) + " (" + str.tostring(slPct, "#.##") + "%) | TP1: " + str.tostring(tp1Price) + " | TP2: " + str.tostring(tp2Price))
+
+// TP1 Hit Alert
+bool tp1Alert = inTrade and tp1Hit and not tp1Hit[1]
+alertcondition(tp1Alert, title="TP1 Hit", message="✅ TP1 HIT — {{ticker}} | Move stop to breakeven | 50% closed")
+
+// TP2 Hit Alert
+bool tp2Alert = inTrade and tp2Hit and not tp2Hit[1]
+alertcondition(tp2Alert, title="TP2 Hit", message="✅ TP2 HIT — {{ticker}} | 85% position closed, trail runner to TP1")
+
+// Stop Loss Hit Alert
+bool slAlert = slHit and not slHit[1]
+alertcondition(slAlert, title="Stop Loss Hit", message="❌ STOP HIT — {{ticker}} | Trade closed at loss")
+
+// New Order Block Alert
+alertcondition(newBullOB or newBearOB, title="New Order Block", message="📦 NEW ORDER BLOCK — {{ticker}} | Check chart for details")
+
+// Liquidity Sweep Alert
+alertcondition(bullSweep or bearSweep, title="Liquidity Sweep", message="💧 LIQUIDITY SWEEP — {{ticker}} | Sweep detected, watch for entry")
+
+
+// ─── G.2: Dashboard Table ───
+if i_showDash and barstate.islast
+    var table dash = table.new(position.top_right, 2, 20, bgcolor=color.new(color.black, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=2)
+
+    // ─── Header ───
+    table.cell(dash, 0, 0, "⚡ SIGNAL ENGINE", text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+    table.cell(dash, 1, 0, syminfo.tickerid + " | " + timeframe.period, text_color=color.white, text_size=size.small, bgcolor=color.new(color.blue, 60))
+
+    // ─── Structure Bias ───
+    string biasText = structureBias == 1 ? "BULLISH 📈" : structureBias == -1 ? "BEARISH 📉" : "CHOP ⚠️"
+    color biasColor = structureBias == 1 ? C_BULL : structureBias == -1 ? C_BEAR : C_NEUTRAL
+    table.cell(dash, 0, 1, "Structure Bias", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 1, biasText, text_color=biasColor, text_size=size.tiny)
+
+    // ─── HTF Trend ───
+    bool htfAligned = i_htfFilter ? (structureBias == 1 ? htf_ema21 > htf_ema50 : structureBias == -1 ? htf_ema21 < htf_ema50 : false) : true
+    string htfText = htfAligned ? "ALIGNED ✅" : "AGAINST ❌"
+    color htfColor = htfAligned ? C_BULL : C_BEAR
+    table.cell(dash, 0, 2, "HTF Trend", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 2, htfText, text_color=htfColor, text_size=size.tiny)
+
+    // ─── Active OB ───
+    bool hasActiveOB = (array.size(bullOBs) > 0 and structureBias == 1) or (array.size(bearOBs) > 0 and structureBias == -1)
+    table.cell(dash, 0, 3, "Active OB", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 3, hasActiveOB ? "YES ✅" : "NO ❌", text_color=hasActiveOB ? C_BULL : C_BEAR, text_size=size.tiny)
+
+    // ─── Liquidity Swept ───
+    table.cell(dash, 0, 4, "Liquidity Swept", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 4, (bullSweep or bearSweep) ? "YES ✅" : "NO", text_color=(bullSweep or bearSweep) ? C_BULL : color.gray, text_size=size.tiny)
+
+    // ─── Session ───
+    string sessText = inLondon ? "LONDON 🇬🇧" : inNewYork ? "NEW YORK 🇺🇸" : inAsian ? "ASIAN (BLOCKED)" : "OFF-SESSION"
+    color sessColor = sessionActive ? C_BULL : C_BEAR
+    table.cell(dash, 0, 5, "Session Active", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 5, sessText, text_color=sessColor, text_size=size.tiny)
+
+
+    // ─── Signal Status ───
+    string sigStatus = inTrade ? "IN TRADE 🔄" : signalsToday >= i_dailyLimit ? "BLOCKED (LIMIT)" : structureBias == 0 ? "BLOCKED (CHOP)" : not sessionActive and i_sessionFilter ? "WAITING (SESSION)" : "READY ✅"
+    color sigColor = inTrade ? color.new(color.yellow, 0) : sigStatus == "READY ✅" ? C_BULL : C_BEAR
+    table.cell(dash, 0, 6, "Signal Status", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 6, sigStatus, text_color=sigColor, text_size=size.tiny)
+
+    // ─── Separator ───
+    table.cell(dash, 0, 7, "───────────", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 7, "───────────", text_color=color.gray, text_size=size.tiny)
+
+    // ─── Last Signal Info ───
+    string dirText = signalDir == 1 ? "LONG ▲" : signalDir == -1 ? "SHORT ▼" : "—"
+    color dirColor = signalDir == 1 ? C_BULL : signalDir == -1 ? C_BEAR : color.gray
+    table.cell(dash, 0, 8, "Last Signal", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 8, dirText, text_color=dirColor, text_size=size.tiny)
+
+    table.cell(dash, 0, 9, "Entry Price", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 9, not na(entryPrice) ? "$" + str.tostring(entryPrice, "#.##") : "—", text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 10, "Stop Loss", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 10, not na(slPrice) ? "$" + str.tostring(inTrade ? tradeSL : slPrice, "#.##") + " | " + str.tostring(slPct, "#.##") + "%" : "—", text_color=C_BEAR, text_size=size.tiny)
+
+    table.cell(dash, 0, 11, "TP1 (1:1)", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 11, not na(tp1Price) ? "$" + str.tostring(tp1Price, "#.##") + (tp1Hit ? " ✅" : "") : "—", text_color=C_TP1, text_size=size.tiny)
+
+    table.cell(dash, 0, 12, "TP2 (1:2)", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 12, not na(tp2Price) ? "$" + str.tostring(tp2Price, "#.##") + (tp2Hit ? " ✅" : "") : "—", text_color=C_TP2, text_size=size.tiny)
+
+    table.cell(dash, 0, 13, "TP3 (Runner)", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 13, not na(tp3Price) ? "$" + str.tostring(tp3Price, "#.##") : "—", text_color=C_TP3, text_size=size.tiny)
+
+    table.cell(dash, 0, 14, "Path Clear?", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 14, pathClear ? "✅ CLEAR" : "❌ BLOCKED", text_color=pathClear ? C_BULL : C_BEAR, text_size=size.tiny)
+
+
+    // ─── Separator ───
+    table.cell(dash, 0, 15, "───────────", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 15, "───────────", text_color=color.gray, text_size=size.tiny)
+
+    // ─── Position Sizing ───
+    float riskAmt_d = i_accountSize * (i_riskPercent / 100)
+    table.cell(dash, 0, 16, "Account Size", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 16, "$" + str.tostring(i_accountSize, "#.##"), text_color=color.white, text_size=size.tiny)
+
+    table.cell(dash, 0, 17, "Risk (" + str.tostring(i_riskPercent, "#.#") + "%)", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 17, "$" + str.tostring(riskAmt_d, "#.##"), text_color=color.white, text_size=size.tiny)
+
+    string posTxt = not na(posSize) ? str.tostring(posSize, "#.####") + " units" : "—"
+    table.cell(dash, 0, 18, "Position Size", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 18, posTxt, text_color=color.white, text_size=size.tiny)
+
+    string levTxt = not na(leverageReq) ? str.tostring(leverageReq, "#.#") + "x" : "—"
+    table.cell(dash, 0, 19, "Leverage", text_color=color.gray, text_size=size.tiny)
+    table.cell(dash, 1, 19, levTxt, text_color=not na(leverageReq) and leverageReq > 5 ? color.yellow : color.white, text_size=size.tiny)
+
+
+// ─── G.3: Secondary Info Table (bottom-right) — Session & Stats ───
+if i_showDash and barstate.islast
+    var table stats = table.new(position.bottom_right, 2, 4, bgcolor=color.new(color.black, 10), border_color=color.new(color.gray, 50), border_width=1, frame_color=color.new(color.gray, 30), frame_width=1)
+
+    // Current UTC time
+    string timeText = str.tostring(hour(timenow, "UTC"), "00") + ":" + str.tostring(minute(timenow, "UTC"), "00") + " UTC"
+    table.cell(stats, 0, 0, "Time", text_color=color.gray, text_size=size.tiny)
+    table.cell(stats, 1, 0, timeText, text_color=color.white, text_size=size.tiny)
+
+    // Signals today
+    table.cell(stats, 0, 1, "Signals Today", text_color=color.gray, text_size=size.tiny)
+    table.cell(stats, 1, 1, str.tostring(signalsToday) + " / " + str.tostring(i_dailyLimit) + " max", text_color=signalsToday >= i_dailyLimit ? C_BEAR : color.white, text_size=size.tiny)
+
+    // Paper P&L
+    string pnlText = (paperPnL >= 0 ? "+" : "") + "$" + str.tostring(paperPnL, "#.##")
+    color pnlColor = paperPnL >= 0 ? C_BULL : C_BEAR
+    table.cell(stats, 0, 2, "Paper P&L", text_color=color.gray, text_size=size.tiny)
+    table.cell(stats, 1, 2, pnlText, text_color=pnlColor, text_size=size.tiny)
+
+    // ATR info
+    table.cell(stats, 0, 3, "ATR(14)", text_color=color.gray, text_size=size.tiny)
+    table.cell(stats, 1, 3, "$" + str.tostring(atr14, "#.##") + " (" + str.tostring(atr14 / close * 100, "#.##") + "%)", text_color=color.white, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// END OF INDICATOR
+// ══════════════════════════════════════════════════════════════
