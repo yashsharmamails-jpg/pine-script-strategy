@@ -1,0 +1,385 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// ULTIMATE Crypto Futures Strategy v3.0 — Hybrid Trend + Mean Reversion
+// Based on research: ADX trend filtering, EMA regime, Bollinger mean reversion,
+// ICT Silver Bullet time windows, RSI divergence, and tight risk management.
+// Designed for ALL crypto futures pairs (BTC, ETH, SOL, etc.) on 15m-1H
+
+//@version=6
+strategy("Ultimate Crypto v3 | Hybrid", overlay=true, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=95, commission_type=strategy.commission.percent, commission_value=0.04, slippage=1, pyramiding=0, max_bars_back=5000, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ══════════════════════════════════════════════════════════════
+// RESEARCH-BACKED DESIGN PHILOSOPHY:
+// 1. DUAL MODE: Trend-following when ADX>25, Mean-reversion when ADX<20
+// 2. TIGHT RISK: Max 0.5% SL, 1.5-2R TP (proven 40-55% WR is profitable at 2R)
+// 3. TIME WINDOWS: Trade during London-NY overlap (peak volume & volatility)
+// 4. REGIME DETECTION: Don't trade chop — ADX between 20-25 = no trade zone
+// 5. CONFLUENCE: Minimum 3 aligned signals before entry
+// 6. MEAN REVERSION: Bollinger + RSI oversold/overbought in ranging markets
+// 7. TREND FOLLOWING: EMA stack + ADX + momentum in trending markets
+// ══════════════════════════════════════════════════════════════
+
+// ─── INPUTS ───
+grpRisk = "Risk Management"
+i_slPct         = input.float(0.5, "Max SL (%)", minval=0.2, maxval=1.0, step=0.1, group=grpRisk, tooltip="Max stop loss distance as % of price")
+i_trendRR       = input.float(2.0, "Trend Mode R:R", minval=1.0, maxval=4.0, step=0.25, group=grpRisk)
+i_meanRevRR     = input.float(1.5, "Mean Reversion R:R", minval=1.0, maxval=3.0, step=0.25, group=grpRisk)
+i_trailBE       = input.bool(true, "Trail to BE after 1R", group=grpRisk)
+i_timeExit      = input.int(16, "Time Exit (bars)", minval=5, maxval=40, group=grpRisk)
+i_dailyMax      = input.int(4, "Max Trades/Day", minval=1, maxval=8, group=grpRisk)
+i_maxDailyLoss  = input.float(3.0, "Max Daily Loss (%)", minval=1.0, maxval=10.0, step=0.5, group=grpRisk)
+
+grpRegime = "Market Regime"
+i_adxLen        = input.int(14, "ADX Length", minval=7, maxval=21, group=grpRegime)
+i_adxTrend      = input.float(25.0, "ADX Trending Threshold", minval=20, maxval=35, step=1, group=grpRegime)
+i_adxRange      = input.float(20.0, "ADX Ranging Threshold", minval=10, maxval=25, step=1, group=grpRegime)
+i_emaFast       = input.int(9, "EMA Fast", group=grpRegime)
+i_emaMid        = input.int(21, "EMA Mid", group=grpRegime)
+i_emaSlow       = input.int(50, "EMA Slow", group=grpRegime)
+
+grpMeanRev = "Mean Reversion"
+i_bbLen         = input.int(20, "Bollinger Length", minval=10, maxval=30, group=grpMeanRev)
+i_bbMult        = input.float(2.0, "Bollinger Mult", minval=1.5, maxval=3.0, step=0.1, group=grpMeanRev)
+i_rsiOB         = input.int(70, "RSI Overbought", minval=65, maxval=80, group=grpMeanRev)
+i_rsiOS         = input.int(30, "RSI Oversold", minval=20, maxval=35, group=grpMeanRev)
+
+grpSession = "Session & Filters"
+i_useSession    = input.bool(true, "Use Session Filter", group=grpSession)
+i_useLondon     = input.bool(true, "London Session (07-11 UTC)", group=grpSession)
+i_useNY         = input.bool(true, "New York Session (13-20 UTC)", group=grpSession)
+i_useOverlap    = input.bool(true, "London-NY Overlap (13-16 UTC) — best window", group=grpSession)
+i_volFilter     = input.bool(true, "Volatility Expansion Filter", group=grpSession)
+
+grpVis = "Visuals"
+i_showBoxes     = input.bool(true, "Show Entry/TP/SL Boxes", group=grpVis)
+i_showRegime    = input.bool(true, "Show Regime Background", group=grpVis)
+
+
+// ══════════════════════════════════════════════════════════════
+// CORE INDICATORS
+// ══════════════════════════════════════════════════════════════
+
+// EMAs
+float emaFast = ta.ema(close, i_emaFast)
+float emaMid  = ta.ema(close, i_emaMid)
+float emaSlow = ta.ema(close, i_emaSlow)
+
+// ADX (Trend Strength)
+[diPlus, diMinus, adxValue] = ta.dmi(i_adxLen, i_adxLen)
+
+// RSI
+float rsi = ta.rsi(close, 14)
+
+// Bollinger Bands
+[bbUpper, bbBasis, bbLower] = ta.bb(close, i_bbLen, i_bbMult)
+
+// ATR
+float atr = ta.atr(14)
+float atrPct = atr / close * 100
+
+// Volatility: is current ATR above its average? (expanding = good for trend)
+float atrAvg = ta.sma(atr, 50)
+bool volExpanding = i_volFilter ? (atr > atrAvg * 1.05) : true
+
+// VWAP (intraday anchor)
+float vwapValue = ta.vwap(close)
+
+
+// ══════════════════════════════════════════════════════════════
+// MARKET REGIME DETECTION
+// ══════════════════════════════════════════════════════════════
+
+// Regime: TRENDING, RANGING, or CHOPPY (no-trade)
+bool isTrending = adxValue > i_adxTrend
+bool isRanging  = adxValue < i_adxRange
+bool isChoppy   = not isTrending and not isRanging  // dead zone, stay flat
+
+// Trend direction (only valid when trending)
+bool bullTrend = isTrending and emaFast > emaMid and emaMid > emaSlow and diPlus > diMinus
+bool bearTrend = isTrending and emaFast < emaMid and emaMid < emaSlow and diMinus > diPlus
+
+// Ranging bias (for mean reversion: trade toward the mean)
+bool rangingBullSetup = isRanging and close < bbLower and rsi < i_rsiOS
+bool rangingBearSetup = isRanging and close > bbUpper and rsi > i_rsiOB
+
+
+// ══════════════════════════════════════════════════════════════
+// SESSION & TIME FILTERS
+// ══════════════════════════════════════════════════════════════
+
+utcHour = hour(time, "UTC")
+bool inLondon  = utcHour >= 7 and utcHour < 11
+bool inNY      = utcHour >= 13 and utcHour < 20
+bool inOverlap = utcHour >= 13 and utcHour < 16
+
+bool sessionOK = true
+if i_useSession
+    if i_useOverlap
+        sessionOK := inOverlap or (i_useLondon and inLondon) or (i_useNY and inNY)
+    else
+        sessionOK := (i_useLondon and inLondon) or (i_useNY and inNY)
+
+// Daily trade counter & daily loss circuit breaker
+var int tradestoday = 0
+var int lastDay = 0
+var float dailyPnLstart = 0.0
+
+if dayofmonth(time, "UTC") != lastDay
+    tradestoday := 0
+    lastDay := dayofmonth(time, "UTC")
+    dailyPnLstart := strategy.equity
+
+bool dailyLimitOK = tradestoday < i_dailyMax
+float dailyLoss = (strategy.equity - dailyPnLstart) / dailyPnLstart * 100
+bool dailyLossOK = dailyLoss > -i_maxDailyLoss
+
+
+// ══════════════════════════════════════════════════════════════
+// TREND MODE SIGNALS (ADX > 25)
+// ══════════════════════════════════════════════════════════════
+// Logic: Price pulls back to EMA zone during strong trend, then resumes
+
+// Pullback to value in uptrend
+bool trendLongPullback = bullTrend and low <= emaMid * 1.001 and close > emaFast and close > open
+// Momentum confirmation: current bar is strong bullish
+bool trendLongMomentum = close > open and (close - open) > atr * 0.3
+
+// Pullback to value in downtrend  
+bool trendShortPullback = bearTrend and high >= emaMid * 0.999 and close < emaFast and close < open
+bool trendShortMomentum = close < open and (open - close) > atr * 0.3
+
+// Additional: price above VWAP for longs, below for shorts
+bool trendLongVWAP = close > vwapValue
+bool trendShortVWAP = close < vwapValue
+
+// TREND SIGNALS
+bool trendLong  = trendLongPullback and trendLongMomentum and trendLongVWAP and volExpanding
+bool trendShort = trendShortPullback and trendShortMomentum and trendShortVWAP and volExpanding
+
+
+// ══════════════════════════════════════════════════════════════
+// MEAN REVERSION MODE SIGNALS (ADX < 20)
+// ══════════════════════════════════════════════════════════════
+// Logic: Price at Bollinger extreme + RSI extreme → fade back to mean
+
+// Bullish mean reversion: price touches lower BB, RSI oversold, candle shows rejection
+bool mrLongBB  = close < bbLower or low < bbLower
+bool mrLongRSI = rsi < i_rsiOS or rsi[1] < i_rsiOS
+bool mrLongReject = close > open and (close - open) > (high - low) * 0.4  // bullish body
+bool mrLongPrice = close > low + (high - low) * 0.5  // closed in upper half
+
+// Bearish mean reversion: price touches upper BB, RSI overbought
+bool mrShortBB  = close > bbUpper or high > bbUpper
+bool mrShortRSI = rsi > i_rsiOB or rsi[1] > i_rsiOB
+bool mrShortReject = close < open and (open - close) > (high - low) * 0.4  // bearish body
+bool mrShortPrice = close < high - (high - low) * 0.5  // closed in lower half
+
+// MEAN REVERSION SIGNALS
+bool mrLong  = isRanging and mrLongBB and mrLongRSI and mrLongReject and mrLongPrice
+bool mrShort = isRanging and mrShortBB and mrShortRSI and mrShortReject and mrShortPrice
+
+
+// ══════════════════════════════════════════════════════════════
+// COMBINED SIGNAL
+// ══════════════════════════════════════════════════════════════
+
+bool notInPos = strategy.position_size == 0
+bool canTrade = notInPos and barstate.isconfirmed and sessionOK and dailyLimitOK and dailyLossOK and not isChoppy
+
+bool longSignal  = canTrade and (trendLong or mrLong)
+bool shortSignal = canTrade and (trendShort or mrShort)
+
+// Track which mode triggered the trade
+var int tradeMode = 0  // 1=trend, 2=mean-reversion
+
+
+// ══════════════════════════════════════════════════════════════
+// EXECUTION — TIGHT, CALCULATED, DISCIPLINED
+// ══════════════════════════════════════════════════════════════
+
+var float entryPrice = na
+var float slPrice = na
+var float tpPrice = na
+var int tradeDir = 0
+var int entryBar = 0
+var bool beHit = false
+
+// ─── LONG ───
+if longSignal
+    // Determine mode
+    float rrRatio = trendLong ? i_trendRR : i_meanRevRR
+    tradeMode := trendLong ? 1 : 2
+    
+    // SL: below recent candle low or EMA support, capped at max %
+    float sl_candle = math.min(low, low[1], low[2]) - syminfo.mintick * 3
+    float sl_maxDist = close * (i_slPct / 100)
+    float sl_final = math.max(sl_candle, close - sl_maxDist)
+    
+    float dist = close - sl_final
+    float tp_final = close + (dist * rrRatio)
+    
+    // Sanity check: SL not too tight (> 0.1%) and not too wide
+    if dist > close * 0.001 and dist <= sl_maxDist
+        entryPrice := close
+        slPrice := sl_final
+        tpPrice := tp_final
+        tradeDir := 1
+        entryBar := bar_index
+        beHit := false
+        tradestoday += 1
+        
+        strategy.entry("L", strategy.long)
+        strategy.exit("LX", "L", limit=tp_final, stop=sl_final)
+
+// ─── SHORT ───
+if shortSignal
+    float rrRatio = trendShort ? i_trendRR : i_meanRevRR
+    tradeMode := trendShort ? 1 : 2
+    
+    float sl_candle = math.max(high, high[1], high[2]) + syminfo.mintick * 3
+    float sl_maxDist = close * (i_slPct / 100)
+    float sl_final = math.min(sl_candle, close + sl_maxDist)
+    
+    float dist = sl_final - close
+    float tp_final = close - (dist * rrRatio)
+    
+    if dist > close * 0.001 and dist <= sl_maxDist
+        entryPrice := close
+        slPrice := sl_final
+        tpPrice := tp_final
+        tradeDir := -1
+        entryBar := bar_index
+        beHit := false
+        tradestoday += 1
+        
+        strategy.entry("S", strategy.short)
+        strategy.exit("SX", "S", limit=tp_final, stop=sl_final)
+
+
+// ══════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ══════════════════════════════════════════════════════════════
+
+// Trail to breakeven after 1R
+if i_trailBE and strategy.position_size != 0 and not beHit
+    float oneR = math.abs(entryPrice - slPrice)
+    if tradeDir == 1 and high >= entryPrice + oneR
+        beHit := true
+        strategy.exit("LX", "L", limit=tpPrice, stop=entryPrice + syminfo.mintick)
+    if tradeDir == -1 and low <= entryPrice - oneR
+        beHit := true
+        strategy.exit("SX", "S", limit=tpPrice, stop=entryPrice - syminfo.mintick)
+
+// Time-based exit (prevents sitting in dead trades)
+if strategy.position_size != 0 and (bar_index - entryBar) >= i_timeExit
+    strategy.close_all(comment="TimeX")
+
+// Reset
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeDir := 0
+    tradeMode := 0
+
+
+// ══════════════════════════════════════════════════════════════
+// POSITION TOOL VISUALS
+// ══════════════════════════════════════════════════════════════
+
+var box tpBox = na, var box slBox = na
+var line eLine = na, var line tLine = na, var line sLine = na
+var label eLbl = na, var label tLbl = na, var label sLbl = na
+
+if (longSignal or shortSignal) and i_showBoxes
+    box.delete(tpBox), box.delete(slBox)
+    line.delete(eLine), line.delete(tLine), line.delete(sLine)
+    label.delete(eLbl), label.delete(tLbl), label.delete(sLbl)
+    
+    int x1 = bar_index, int x2 = bar_index + 12
+    string modeStr = tradeMode == 1 ? "TREND" : "MR"
+    
+    eLine := line.new(x1, entryPrice, x2, entryPrice, color=color.new(#2196F3, 0), width=2)
+    eLbl := label.new(x2, entryPrice, modeStr + " | " + str.tostring(entryPrice, "#.#"), textcolor=color.white, style=label.style_label_left, size=size.tiny, color=color.new(#2196F3, 15))
+    
+    if longSignal
+        tpBox := box.new(x1, tpPrice, x2, entryPrice, bgcolor=color.new(#00E676, 93), border_color=color.new(#00E676, 40))
+        slBox := box.new(x1, entryPrice, x2, slPrice, bgcolor=color.new(#FF5252, 93), border_color=color.new(#FF5252, 40))
+    else
+        tpBox := box.new(x1, entryPrice, x2, tpPrice, bgcolor=color.new(#00E676, 93), border_color=color.new(#00E676, 40))
+        slBox := box.new(x1, slPrice, x2, entryPrice, bgcolor=color.new(#FF5252, 93), border_color=color.new(#FF5252, 40))
+    
+    tLine := line.new(x1, tpPrice, x2, tpPrice, color=#00E676, width=2)
+    tLbl := label.new(x2, tpPrice, "TP " + str.tostring(tpPrice, "#.#"), textcolor=#00E676, style=label.style_label_left, size=size.tiny, color=color.new(#00E676, 15))
+    sLine := line.new(x1, slPrice, x2, slPrice, color=#FF5252, width=2)
+    sLbl := label.new(x2, slPrice, "SL " + str.tostring(slPrice, "#.#"), textcolor=#FF5252, style=label.style_label_left, size=size.tiny, color=color.new(#FF5252, 15))
+
+if strategy.position_size != 0 and i_showBoxes and not na(tpBox)
+    box.set_right(tpBox, bar_index + 3), box.set_right(slBox, bar_index + 3)
+    line.set_x2(eLine, bar_index + 3), line.set_x2(tLine, bar_index + 3), line.set_x2(sLine, bar_index + 3)
+    label.set_x(eLbl, bar_index + 3), label.set_x(tLbl, bar_index + 3), label.set_x(sLbl, bar_index + 3)
+
+
+// ══════════════════════════════════════════════════════════════
+// CHART VISUALS
+// ══════════════════════════════════════════════════════════════
+
+plotshape(longSignal and trendLong, "Trend Long", shape.triangleup, location.belowbar, #00E676, size=size.small, text="TL")
+plotshape(longSignal and mrLong, "MR Long", shape.diamond, location.belowbar, #00BCD4, size=size.small, text="MR")
+plotshape(shortSignal and trendShort, "Trend Short", shape.triangledown, location.abovebar, #FF5252, size=size.small, text="TS")
+plotshape(shortSignal and mrShort, "MR Short", shape.diamond, location.abovebar, #FF9800, size=size.small, text="MR")
+
+plot(emaFast, "EMA Fast", color=color.new(#26C6DA, 60), linewidth=1)
+plot(emaMid, "EMA Mid", color=color.new(#FFA726, 60), linewidth=1)
+plot(emaSlow, "EMA Slow", color=color.new(color.white, 70), linewidth=2)
+plot(bbUpper, "BB Upper", color=color.new(#9C27B0, 75), linewidth=1)
+plot(bbLower, "BB Lower", color=color.new(#9C27B0, 75), linewidth=1)
+
+// Regime background
+color regimeBG = na
+if i_showRegime
+    regimeBG := isTrending ? color.new(#00E676, 97) : isRanging ? color.new(#2196F3, 97) : color.new(#FF5252, 98)
+bgcolor(regimeBG)
+
+// Session highlight
+bgcolor(inOverlap and i_useSession ? color.new(#FFD600, 97) : na, title="Overlap BG")
+
+
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════
+
+if barstate.islast
+    var table d = table.new(position.top_right, 2, 9, bgcolor=color.new(#0d1117, 0), border_color=color.new(color.gray, 70), border_width=1, frame_width=2, frame_color=color.new(#161b22, 0))
+    
+    table.cell(d, 0, 0, "ULTIMATE v3", text_color=color.white, text_size=size.small, bgcolor=color.new(#238636, 20))
+    table.cell(d, 1, 0, syminfo.ticker + " " + timeframe.period, text_color=color.white, text_size=size.small, bgcolor=color.new(#238636, 20))
+    
+    string regime = isTrending ? "TRENDING" : isRanging ? "RANGING" : "CHOP"
+    color regC = isTrending ? #00E676 : isRanging ? #2196F3 : #FF5252
+    table.cell(d, 0, 1, "Regime", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 1, regime + " (ADX:" + str.tostring(adxValue, "#.#") + ")", text_color=regC, text_size=size.tiny)
+    
+    string trendDir = bullTrend ? "BULL" : bearTrend ? "BEAR" : "—"
+    table.cell(d, 0, 2, "Direction", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 2, trendDir, text_color=bullTrend ? #00E676 : bearTrend ? #FF5252 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 3, "RSI", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 3, str.tostring(rsi, "#.#"), text_color=rsi > 70 ? #FF5252 : rsi < 30 ? #00E676 : color.white, text_size=size.tiny)
+    
+    table.cell(d, 0, 4, "Volatility", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 4, volExpanding ? "EXPANDING" : "FLAT", text_color=volExpanding ? #00E676 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 5, "Session", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 5, inOverlap ? "OVERLAP" : inLondon ? "LONDON" : inNY ? "NY" : "OFF", text_color=sessionOK ? #00E676 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 6, "Trades", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 6, str.tostring(tradestoday) + "/" + str.tostring(i_dailyMax), text_color=color.white, text_size=size.tiny)
+    
+    string pos = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    table.cell(d, 0, 7, "Position", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 7, pos + (tradeMode == 1 ? " [T]" : tradeMode == 2 ? " [MR]" : ""), text_color=strategy.position_size > 0 ? #00E676 : strategy.position_size < 0 ? #FF5252 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 8, "Net P&L", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 8, "$" + str.tostring(strategy.netprofit, "#.##") + " (" + str.tostring(strategy.netprofit / strategy.initial_capital * 100, "#.#") + "%)", text_color=strategy.netprofit >= 0 ? #00E676 : #FF5252, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// END OF STRATEGY
+// ══════════════════════════════════════════════════════════════
