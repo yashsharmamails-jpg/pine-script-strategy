@@ -2,7 +2,7 @@
 // https://mozilla.org/MPL/2.0/
 // © Institutional Crypto Futures Signal Engine v1.0
 
-//@version=5
+//@version=6
 indicator("⚡ ICT Signal Engine", overlay=true, max_lines_count=500, max_boxes_count=500, max_labels_count=500, max_bars_back=5000)
 
 // ══════════════════════════════════════════════════════════════
@@ -1346,10 +1346,10 @@ plotshape(not na(swingLow) and i_showStructure, title="Swing Low", style=shape.c
 
 // ─── G.1: Alert Conditions ───
 // Long Signal Alert
-alertcondition(longSignal, title="LONG Signal Fired", message="🟢 LONG SIGNAL — {{ticker}} | Entry: {{close}} | SL: " + str.tostring(slPrice) + " (" + str.tostring(slPct, "#.##") + "%) | TP1: " + str.tostring(tp1Price) + " | TP2: " + str.tostring(tp2Price))
+alertcondition(longSignal, title="LONG Signal Fired", message="🟢 LONG SIGNAL — {{ticker}} | Entry: {{close}} | Check chart for SL/TP levels")
 
 // Short Signal Alert
-alertcondition(shortSignal, title="SHORT Signal Fired", message="🔴 SHORT SIGNAL — {{ticker}} | Entry: {{close}} | SL: " + str.tostring(slPrice) + " (" + str.tostring(slPct, "#.##") + "%) | TP1: " + str.tostring(tp1Price) + " | TP2: " + str.tostring(tp2Price))
+alertcondition(shortSignal, title="SHORT Signal Fired", message="🔴 SHORT SIGNAL — {{ticker}} | Entry: {{close}} | Check chart for SL/TP levels")
 
 // TP1 Hit Alert
 bool tp1Alert = inTrade and tp1Hit and not tp1Hit[1]
