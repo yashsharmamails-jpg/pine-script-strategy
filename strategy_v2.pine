@@ -1,0 +1,405 @@
+// This source code is subject to the terms of the Mozilla Public License 2.0
+// https://mozilla.org/MPL/2.0/
+// ICT Smart Money Strategy v2.0 — BTCUSD 15m Optimized
+// Key improvements: Tight stops, trend-following, displacement confirmation, volatility filter
+
+//@version=6
+strategy("ICT SMC v2 | BTCUSD", overlay=true, initial_capital=1000, default_qty_type=strategy.percent_of_equity, default_qty_value=95, commission_type=strategy.commission.percent, commission_value=0.04, slippage=1, pyramiding=0, max_bars_back=5000, calc_on_every_tick=false, process_orders_on_close=true)
+
+// ══════════════════════════════════════════════════════════════
+// INPUTS
+// ══════════════════════════════════════════════════════════════
+
+grpRisk = "Risk Management"
+i_slPercent     = input.float(0.6, "Max SL Distance (%)", minval=0.2, maxval=1.5, step=0.1, group=grpRisk)
+i_rrRatio       = input.float(1.5, "R:R Ratio (TP)", minval=1.0, maxval=3.0, step=0.25, group=grpRisk)
+i_trailBE       = input.bool(true, "Move SL to BE after 1R", group=grpRisk)
+i_maxBarsInTrade = input.int(20, "Max Bars in Trade", minval=5, maxval=50, group=grpRisk)
+i_dailyLimit    = input.int(4, "Max Trades Per Day", minval=1, maxval=8, group=grpRisk)
+
+grpEntry = "Entry Conditions"
+i_requireDisplacement = input.bool(true, "Require Displacement Candle", group=grpEntry)
+i_minBodyRatio  = input.float(0.6, "Min Body/Range Ratio (Displacement)", minval=0.4, maxval=0.9, step=0.05, group=grpEntry)
+i_requireOBorFVG = input.bool(true, "Require OB or FVG Zone", group=grpEntry)
+i_sessionFilter = input.bool(true, "Session Filter (London+NY only)", group=grpEntry)
+i_trendFilter   = input.bool(true, "EMA Trend Filter", group=grpEntry)
+i_volFilter     = input.bool(true, "Volatility Expansion Filter", group=grpEntry)
+
+grpStructure = "Structure"
+i_pivotBars     = input.int(3, "Swing Pivot Lookback", minval=2, maxval=5, group=grpStructure)
+i_obImpulse     = input.float(0.8, "OB Impulse Threshold (ATR x)", minval=0.3, maxval=2.0, step=0.1, group=grpStructure)
+
+// ══════════════════════════════════════════════════════════════
+// CORE CALCULATIONS
+// ══════════════════════════════════════════════════════════════
+
+float atr14 = ta.atr(14)
+float atr7  = ta.atr(7)
+float rsi14 = ta.rsi(close, 14)
+float ema9  = ta.ema(close, 9)
+float ema21 = ta.ema(close, 21)
+float ema50 = ta.ema(close, 50)
+
+// Volatility expansion: current ATR > 1.1x 50-period average ATR
+float atrAvg = ta.sma(atr14, 50)
+bool volExpanding = i_volFilter ? (atr14 > atrAvg * 1.1) : true
+
+// Session Detection (UTC)
+utcHour = hour(time, "UTC")
+inLondon  = utcHour >= 7 and utcHour < 11
+inNewYork = utcHour >= 13 and utcHour < 19
+sessionOK = i_sessionFilter ? (inLondon or inNewYork) : true
+
+// EMA Trend
+bool bullTrend = i_trendFilter ? (ema9 > ema21 and ema21 > ema50) : true
+bool bearTrend = i_trendFilter ? (ema9 < ema21 and ema21 < ema50) : true
+
+// Daily counter
+var int signalsToday = 0
+var int lastResetDay = 0
+if dayofmonth(time, "UTC") != lastResetDay
+    signalsToday := 0
+    lastResetDay := dayofmonth(time, "UTC")
+
+// ══════════════════════════════════════════════════════════════
+// MARKET STRUCTURE
+// ══════════════════════════════════════════════════════════════
+
+swingHigh = ta.pivothigh(high, i_pivotBars, i_pivotBars)
+swingLow  = ta.pivotlow(low, i_pivotBars, i_pivotBars)
+
+var float sh_1 = na, var float sh_2 = na
+var float sl_1 = na, var float sl_2 = na
+var int sh_1_bar = na, var int sl_1_bar = na
+
+if not na(swingHigh)
+    sh_2 := sh_1
+    sh_1 := swingHigh
+    sh_1_bar := bar_index - i_pivotBars
+
+if not na(swingLow)
+    sl_2 := sl_1
+    sl_1 := swingLow
+    sl_1_bar := bar_index - i_pivotBars
+
+// Structure bias
+var int structureBias = 0
+bool hasHH = not na(sh_1) and not na(sh_2) and sh_1 > sh_2
+bool hasHL = not na(sl_1) and not na(sl_2) and sl_1 > sl_2
+bool hasLH = not na(sh_1) and not na(sh_2) and sh_1 < sh_2
+bool hasLL = not na(sl_1) and not na(sl_2) and sl_1 < sl_2
+
+if hasHH and hasHL
+    structureBias := 1
+if hasLH and hasLL
+    structureBias := -1
+
+// BOS Detection (simplified, just track if we broke structure)
+var bool recentBullBOS = false
+var bool recentBearBOS = false
+var int lastBOSbar = 0
+
+if barstate.isconfirmed and not na(sh_1) and close > sh_1 and structureBias == 1
+    recentBullBOS := true
+    recentBearBOS := false
+    lastBOSbar := bar_index
+
+if barstate.isconfirmed and not na(sl_1) and close < sl_1 and structureBias == -1
+    recentBearBOS := true
+    recentBullBOS := false
+    lastBOSbar := bar_index
+
+// Decay BOS signal after 30 bars
+if bar_index - lastBOSbar > 30
+    recentBullBOS := false
+    recentBearBOS := false
+
+// ══════════════════════════════════════════════════════════════
+// ORDER BLOCKS & FVG
+// ══════════════════════════════════════════════════════════════
+
+// Bullish OB: last red candle before a strong green impulse move
+var float bullOB_top = na, var float bullOB_bot = na, var bool bullOB_valid = false
+var float bearOB_top = na, var float bearOB_bot = na, var bool bearOB_valid = false
+
+// Detect OBs on BOS
+if recentBullBOS and recentBullBOS != recentBullBOS[1]
+    float impulse = math.abs(close - open)
+    if impulse >= i_obImpulse * atr14
+        for i = 1 to 8
+            if close[i] < open[i] and (open[i] - close[i]) > 0.3 * (high[i] - low[i])
+                bullOB_top := open[i]
+                bullOB_bot := low[i]
+                bullOB_valid := true
+                break
+
+if recentBearBOS and recentBearBOS != recentBearBOS[1]
+    float impulse = math.abs(close - open)
+    if impulse >= i_obImpulse * atr14
+        for i = 1 to 8
+            if close[i] > open[i] and (close[i] - open[i]) > 0.3 * (high[i] - low[i])
+                bearOB_top := high[i]
+                bearOB_bot := open[i]
+                bearOB_valid := true
+                break
+
+// OB Mitigation
+if bullOB_valid and close < bullOB_bot - atr14 * 0.3
+    bullOB_valid := false
+if bearOB_valid and close > bearOB_top + atr14 * 0.3
+    bearOB_valid := false
+
+// Price in OB
+bool inBullOB = bullOB_valid and low <= bullOB_top and close >= bullOB_bot
+bool inBearOB = bearOB_valid and high >= bearOB_bot and close <= bearOB_top
+
+// FVG Detection
+bool bullFVGnow = low > high[2] and barstate.isconfirmed
+bool bearFVGnow = high < low[2] and barstate.isconfirmed
+
+var float bullFVG_top = na, var float bullFVG_bot = na, var bool bullFVG_valid = false
+var float bearFVG_top = na, var float bearFVG_bot = na, var bool bearFVG_valid = false
+
+if bullFVGnow
+    bullFVG_top := low
+    bullFVG_bot := high[2]
+    bullFVG_valid := true
+if bearFVGnow
+    bearFVG_top := low[2]
+    bearFVG_bot := high
+    bearFVG_valid := true
+
+if bullFVG_valid and close < bullFVG_bot
+    bullFVG_valid := false
+if bearFVG_valid and close > bearFVG_top
+    bearFVG_valid := false
+
+bool inBullFVG = bullFVG_valid and low <= bullFVG_top and close >= bullFVG_bot
+bool inBearFVG = bearFVG_valid and high >= bearFVG_bot and close <= bearFVG_top
+
+bool inBullZone = i_requireOBorFVG ? (inBullOB or inBullFVG) : true
+bool inBearZone = i_requireOBorFVG ? (inBearOB or inBearFVG) : true
+
+// ══════════════════════════════════════════════════════════════
+// DISPLACEMENT CANDLE (Key v2 Addition)
+// ══════════════════════════════════════════════════════════════
+// A displacement candle = strong body, closes near extreme, shows conviction
+
+bool bullDisplacement = false
+bool bearDisplacement = false
+
+if i_requireDisplacement
+    float bodyRatio = math.abs(close - open) / math.max(high - low, syminfo.mintick)
+    float candleSize = high - low
+    
+    // Bullish displacement: strong green candle, body > 60% of range, size > 0.5 ATR
+    bullDisplacement := close > open and bodyRatio >= i_minBodyRatio and candleSize > atr14 * 0.5 and close > high - (candleSize * 0.25)
+    
+    // Bearish displacement: strong red candle, body > 60% of range, size > 0.5 ATR
+    bearDisplacement := close < open and bodyRatio >= i_minBodyRatio and candleSize > atr14 * 0.5 and close < low + (candleSize * 0.25)
+else
+    bullDisplacement := true
+    bearDisplacement := true
+
+// Also accept displacement on previous candle (pullback entry after displacement)
+bool bullDispRecent = bullDisplacement or bullDisplacement[1] or bullDisplacement[2]
+bool bearDispRecent = bearDisplacement or bearDisplacement[1] or bearDisplacement[2]
+
+// ══════════════════════════════════════════════════════════════
+// PULLBACK TO VALUE (Key v2 Addition)
+// ══════════════════════════════════════════════════════════════
+// Enter when price pulls back to EMA9/21 zone after displacement
+
+bool pullbackToBullValue = low <= ema21 * 1.002 and close > ema9 and close > open
+bool pullbackToBearValue = high >= ema21 * 0.998 and close < ema9 and close < open
+
+// ══════════════════════════════════════════════════════════════
+// RSI CONFIRMATION (not overbought/oversold at entry)
+// ══════════════════════════════════════════════════════════════
+
+bool rsiOKlong  = rsi14 > 40 and rsi14 < 70  // Not oversold (weak) or overbought (extended)
+bool rsiOKshort = rsi14 > 30 and rsi14 < 60  // Not extended
+
+// ══════════════════════════════════════════════════════════════
+// SIGNAL GENERATION
+// ══════════════════════════════════════════════════════════════
+
+bool notInPos = strategy.position_size == 0
+bool limitOK = signalsToday < i_dailyLimit
+
+bool longSignal = notInPos and barstate.isconfirmed and limitOK and sessionOK and volExpanding and bullTrend and structureBias == 1 and recentBullBOS and inBullZone and bullDispRecent and (pullbackToBullValue or inBullOB) and rsiOKlong
+
+bool shortSignal = notInPos and barstate.isconfirmed and limitOK and sessionOK and volExpanding and bearTrend and structureBias == -1 and recentBearBOS and inBearZone and bearDispRecent and (pullbackToBearValue or inBearOB) and rsiOKshort
+
+// ══════════════════════════════════════════════════════════════
+// EXECUTION — TIGHT STOPS, ACHIEVABLE TPs
+// ══════════════════════════════════════════════════════════════
+
+var float entryPrice = na
+var float slPrice = na
+var float tpPrice = na
+var int tradeDir = 0
+var int entryBar = 0
+var bool tp1Hit = false
+
+// ─── LONG ───
+if longSignal
+    // TIGHT SL: below candle low or OB bottom, max 0.6%
+    float sl_struct = inBullOB ? bullOB_bot : inBullFVG ? bullFVG_bot : low
+    float sl_candle = math.min(low, low[1]) - syminfo.mintick * 5
+    float sl_raw = math.min(sl_struct, sl_candle)
+    
+    // Cap SL at max % distance
+    float maxSlDist = close * (i_slPercent / 100)
+    float sl_final = math.max(sl_raw, close - maxSlDist)
+    
+    float dist = close - sl_final
+    float tp_final = close + (dist * i_rrRatio)
+    
+    // Only take if risk makes sense (SL not too tight either)
+    if dist > close * 0.001 and dist < close * (i_slPercent / 100)
+        entryPrice := close
+        slPrice := sl_final
+        tpPrice := tp_final
+        tradeDir := 1
+        entryBar := bar_index
+        tp1Hit := false
+        signalsToday += 1
+        
+        strategy.entry("L", strategy.long)
+        strategy.exit("L_Exit", "L", limit=tp_final, stop=sl_final)
+
+// ─── SHORT ───
+if shortSignal
+    float sl_struct = inBearOB ? bearOB_top : inBearFVG ? bearFVG_top : high
+    float sl_candle = math.max(high, high[1]) + syminfo.mintick * 5
+    float sl_raw = math.max(sl_struct, sl_candle)
+    
+    float maxSlDist = close * (i_slPercent / 100)
+    float sl_final = math.min(sl_raw, close + maxSlDist)
+    
+    float dist = sl_final - close
+    float tp_final = close - (dist * i_rrRatio)
+    
+    if dist > close * 0.001 and dist < close * (i_slPercent / 100)
+        entryPrice := close
+        slPrice := sl_final
+        tpPrice := tp_final
+        tradeDir := -1
+        entryBar := bar_index
+        tp1Hit := false
+        signalsToday += 1
+        
+        strategy.entry("S", strategy.short)
+        strategy.exit("S_Exit", "S", limit=tp_final, stop=sl_final)
+
+// ══════════════════════════════════════════════════════════════
+// TRADE MANAGEMENT
+// ══════════════════════════════════════════════════════════════
+
+// Trail to breakeven after 1R profit
+if i_trailBE and strategy.position_size != 0 and not tp1Hit
+    float oneR = math.abs(entryPrice - slPrice)
+    if tradeDir == 1 and high >= entryPrice + oneR
+        tp1Hit := true
+        strategy.exit("L_Exit", "L", limit=tpPrice, stop=entryPrice + syminfo.mintick * 2)
+    if tradeDir == -1 and low <= entryPrice - oneR
+        tp1Hit := true
+        strategy.exit("S_Exit", "S", limit=tpPrice, stop=entryPrice - syminfo.mintick * 2)
+
+// Time-based exit: close stale trades
+if strategy.position_size != 0 and (bar_index - entryBar) >= i_maxBarsInTrade
+    strategy.close_all(comment="Time Exit")
+
+// Reset on flat
+if strategy.position_size == 0 and strategy.position_size[1] != 0
+    tradeDir := 0
+
+// ══════════════════════════════════════════════════════════════
+// POSITION TOOL DRAWING
+// ══════════════════════════════════════════════════════════════
+
+var box tpBox = na, var box slBox = na
+var line entryLine = na, var line tpLine = na, var line slLine = na
+var label entryLbl = na, var label tpLbl = na, var label slLbl = na
+
+if (longSignal or shortSignal)
+    // Cleanup
+    box.delete(tpBox), box.delete(slBox)
+    line.delete(entryLine), line.delete(tpLine), line.delete(slLine)
+    label.delete(entryLbl), label.delete(tpLbl), label.delete(slLbl)
+    
+    int x1 = bar_index, int x2 = bar_index + 15
+    
+    entryLine := line.new(x1, entryPrice, x2, entryPrice, color=color.new(#2196F3, 0), width=2)
+    entryLbl := label.new(x2, entryPrice, "ENTRY " + str.tostring(entryPrice, "#.#"), textcolor=color.white, style=label.style_label_left, size=size.tiny, color=color.new(#2196F3, 20))
+    
+    if longSignal
+        tpBox := box.new(x1, tpPrice, x2, entryPrice, bgcolor=color.new(#00E676, 92), border_color=color.new(#00E676, 50))
+        slBox := box.new(x1, entryPrice, x2, slPrice, bgcolor=color.new(#FF5252, 92), border_color=color.new(#FF5252, 50))
+    else
+        tpBox := box.new(x1, entryPrice, x2, tpPrice, bgcolor=color.new(#00E676, 92), border_color=color.new(#00E676, 50))
+        slBox := box.new(x1, slPrice, x2, entryPrice, bgcolor=color.new(#FF5252, 92), border_color=color.new(#FF5252, 50))
+    
+    tpLine := line.new(x1, tpPrice, x2, tpPrice, color=color.new(#00E676, 0), width=2)
+    tpLbl := label.new(x2, tpPrice, "TP " + str.tostring(tpPrice, "#.#") + " (" + str.tostring(i_rrRatio, "#.##") + "R)", textcolor=#00E676, style=label.style_label_left, size=size.tiny, color=color.new(#00E676, 20))
+    slLine := line.new(x1, slPrice, x2, slPrice, color=color.new(#FF5252, 0), width=2)
+    slLbl := label.new(x2, slPrice, "SL " + str.tostring(slPrice, "#.#"), textcolor=#FF5252, style=label.style_label_left, size=size.tiny, color=color.new(#FF5252, 20))
+
+// Extend while in trade
+if strategy.position_size != 0 and not na(tpBox)
+    box.set_right(tpBox, bar_index + 3), box.set_right(slBox, bar_index + 3)
+    line.set_x2(entryLine, bar_index + 3), line.set_x2(tpLine, bar_index + 3), line.set_x2(slLine, bar_index + 3)
+    label.set_x(entryLbl, bar_index + 3), label.set_x(tpLbl, bar_index + 3), label.set_x(slLbl, bar_index + 3)
+
+// ══════════════════════════════════════════════════════════════
+// VISUALS
+// ══════════════════════════════════════════════════════════════
+
+plotshape(longSignal, title="Long", style=shape.triangleup, location=location.belowbar, color=#00E676, size=size.small, text="L")
+plotshape(shortSignal, title="Short", style=shape.triangledown, location=location.abovebar, color=#FF5252, size=size.small, text="S")
+
+plot(ema9, "EMA 9", color=color.new(#26C6DA, 60), linewidth=1)
+plot(ema21, "EMA 21", color=color.new(#FFA726, 60), linewidth=1)
+plot(ema50, "EMA 50", color=color.new(color.white, 70), linewidth=1)
+
+// Session background
+bgcolor(inLondon ? color.new(#2196F3, 97) : inNewYork ? color.new(#FF9800, 97) : na)
+
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════
+
+if barstate.islast
+    var table d = table.new(position.top_right, 2, 8, bgcolor=color.new(#1a1a2e, 0), border_color=color.new(color.gray, 60), border_width=1, frame_width=2, frame_color=color.new(#16213e, 0))
+    
+    table.cell(d, 0, 0, "SMC v2", text_color=color.white, text_size=size.small, bgcolor=color.new(#0f3460, 0))
+    table.cell(d, 1, 0, syminfo.ticker + " " + timeframe.period, text_color=color.white, text_size=size.small, bgcolor=color.new(#0f3460, 0))
+    
+    string bias = structureBias == 1 ? "BULL" : structureBias == -1 ? "BEAR" : "—"
+    color biasC = structureBias == 1 ? #00E676 : structureBias == -1 ? #FF5252 : color.gray
+    table.cell(d, 0, 1, "Bias", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 1, bias, text_color=biasC, text_size=size.tiny)
+    
+    table.cell(d, 0, 2, "Trend", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 2, bullTrend ? "UP" : bearTrend ? "DOWN" : "FLAT", text_color=bullTrend ? #00E676 : bearTrend ? #FF5252 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 3, "Volatility", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 3, volExpanding ? "EXPANDING" : "LOW", text_color=volExpanding ? #00E676 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 4, "Session", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 4, inLondon ? "LONDON" : inNewYork ? "NY" : "OFF", text_color=sessionOK ? #00E676 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 5, "Trades", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 5, str.tostring(signalsToday) + "/" + str.tostring(i_dailyLimit), text_color=color.white, text_size=size.tiny)
+    
+    string pos = strategy.position_size > 0 ? "LONG" : strategy.position_size < 0 ? "SHORT" : "FLAT"
+    table.cell(d, 0, 6, "Position", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 6, pos, text_color=strategy.position_size > 0 ? #00E676 : strategy.position_size < 0 ? #FF5252 : color.gray, text_size=size.tiny)
+    
+    table.cell(d, 0, 7, "Net P&L", text_color=color.gray, text_size=size.tiny)
+    table.cell(d, 1, 7, "$" + str.tostring(strategy.netprofit, "#.##"), text_color=strategy.netprofit >= 0 ? #00E676 : #FF5252, text_size=size.tiny)
+
+// ══════════════════════════════════════════════════════════════
+// END
+// ══════════════════════════════════════════════════════════════
